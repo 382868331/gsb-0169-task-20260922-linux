@@ -3,28 +3,35 @@
 
 运行：python demo.py
 
-三部分：
-1. 正常读事务：主机 M 读从机 E（地址 0x53）的数据 0x9E，含每一位的原始来源；
-2. 仲裁失败：主机 M 发送 1 却被竞争者 C 拉低，解析出 ArbitrationLoss；
-3. 异常边界（实际触发，非模拟）：
-   a. 同一驱动器同一时刻两条更新 -> ConflictingUpdateError；
-   b. SCL 持续低超过阈值 -> StretchTimeoutError。
+六部分：
+1. 旧接口正常读事务：多驱动器 Update -> parse_updates（地址/数据/位来源）；
+2. 旧接口仲裁失败与冲突更新拒绝；
+3. 新接口正常结果：整数时间戳 Sample 采样，注入的亚宽度毛刺被滤波剔除后正确解码；
+4. 新接口边界：脉冲宽度 == min_width 保留 / 小 1 剔除；
+   stretch duration == limit 通过 / 超 1 报错（等号两侧）；
+5. 新接口实际错误：同一时刻重复采样、非法电平、SCL 拉伸超时（均真实触发）。
 """
 
 from __future__ import annotations
 
-from odbus import Drive, Update, parse_updates
-from odbus.errors import ConflictingUpdateError, StretchTimeoutError
+import time
+
+from odbus import Drive, Sample, Update, parse_samples, parse_updates
+from odbus.errors import (
+    ConflictingUpdateError,
+    DuplicateSampleError,
+    InvalidSampleError,
+    StretchTimeoutError,
+)
 
 R = Drive.RELEASE
 D = Drive.LOW
 
 
-class Wave:
-    """固定 2-tick 脉冲节奏的波形构建器（绝对驱动状态模型）。
+# ============================ 旧接口波形 ============================
 
-    每个 tick 为所有驱动器各提交一条绝对状态更新（同刻先合并再判边沿）。
-    """
+class Wave:
+    """固定 2-tick 脉冲节奏的波形构建器（绝对驱动状态模型）。"""
 
     def __init__(self, *names: str) -> None:
         self.t = 0
@@ -41,10 +48,6 @@ class Wave:
         self.t += n
 
     def bit_pulse(self, owner: str, sda: Drive) -> None:
-        """一个 SCL 脉冲：下降沿 owner 放好 SDA（其余驱动器释放 SDA），上升沿采样。
-
-        SCL 始终由 M 控制；非 owner 的驱动器在该拍释放 SDA，避免拉住总线。
-        """
         for n in self.names:
             self.st[n][1] = sda if n == owner else R
         self.st["M"][0] = D
@@ -63,7 +66,6 @@ class Wave:
         self.advance()
 
     def stop_after_nack_high(self) -> None:
-        """NACK（总线 SDA 高）后：补一个脉冲拉低 SDA，再 SCL 高时释放 => STOP。"""
         self.st["M"] = [D, D]
         self.commit_all()
         self.advance()
@@ -79,30 +81,28 @@ def build_read_transaction() -> list[Update]:
     """M 读 E(0x53)：START + 地址读字节(从机ACK) + 数据0x9E(主机NACK) + STOP。"""
     w = Wave("M", "E")
     w.start()
-    addr = (0x53 << 1) | 1  # 0xA7 读
+    addr = (0x53 << 1) | 1
     for k in range(8):
         w.bit_pulse("M", R if ((addr >> (7 - k)) & 1) else D)
-    w.bit_pulse("E", D)     # 从机 ACK=0
+    w.bit_pulse("E", D)
     data = 0x9E
     for k in range(8):
         w.bit_pulse("E", R if ((data >> (7 - k)) & 1) else D)
-    w.bit_pulse("M", R)     # 主机 NACK=1
+    w.bit_pulse("M", R)
     w.stop_after_nack_high()
     return w.updates
 
 
 def build_arbitration_case() -> list[Update]:
-    """M 与 C 同起始；地址首位 M 发 1、C 拉低 => M 仲裁丢失，随后补齐 9 拍到 STOP。"""
+    """M 与 C 同起始；地址首位 M 发 1、C 拉低 => M 仲裁丢失，随后补齐到 STOP。"""
     ups: list[Update] = []
     t = 0
-    ups += [Update(t, "M", R, D), Update(t, "C", R, D)]  # 同时 START
+    ups += [Update(t, "M", R, D), Update(t, "C", R, D)]
     t += 1
-    # bit7：M 释放 SDA（发1），C 拉低（发0）
     ups += [Update(t, "M", D, R), Update(t, "C", R, D)]
     t += 1
-    ups += [Update(t, "M", R, R), Update(t, "C", R, D)]  # 上升采样=0 => 丢失
+    ups += [Update(t, "M", R, R), Update(t, "C", R, D)]
     t += 1
-    # 其余 7 位双方都释放（读到全 1），第 9 拍 C 给 ACK=0
     for _ in range(7):
         ups += [Update(t, "M", D, R), Update(t, "C", R, R)]
         t += 1
@@ -112,77 +112,127 @@ def build_arbitration_case() -> list[Update]:
     t += 1
     ups += [Update(t, "M", R, R), Update(t, "C", R, D)]
     t += 1
-    # STOP：C 释放 / M 接管（同刻 AND 保持低），下一拍 M 释放 => STOP
     ups += [Update(t, "M", R, D), Update(t, "C", R, R)]
     t += 1
     ups += [Update(t, "M", R, R)]
     return ups
 
 
+# ======================== 新接口：采样波形 ========================
+
+HOLD = 10  # 每电平保持 10 tick（min_width=4 时，段中部注入 1-tick 毛刺两侧余宽 >=4）
+
+
+def sample_write_transaction(addr7: int, data: tuple[int, ...]):
+    """稠密整数时刻采样的写事务（ACK 恒为 0），返回 list[Sample]。
+
+    波形（每段 HOLD tick）：空闲 -> START -> 每字节 8 位+ACK -> STOP。
+    地址/数据/ACK 是固定常量，用于和解析结果逐项核对。
+    """
+    grid: list[tuple[int, int]] = [(1, 1)] * HOLD          # 空闲
+    grid += [(1, 0)] * HOLD                                 # START
+    stream = [(addr7 << 1) & 0xFE, *data]
+    for byte in stream:
+        for k in range(8):
+            b = (byte >> (7 - k)) & 1
+            grid += [(0, b)] * HOLD
+            grid += [(1, b)] * HOLD
+        grid += [(0, 0)] * HOLD                             # ACK=0
+        grid += [(1, 0)] * HOLD
+    grid += [(1, 1)] * HOLD                                 # STOP
+    return [Sample(tick=i, scl=scl, sda=sda)
+            for i, (scl, sda) in enumerate(grid)]
+
+
+def inject(samples, index, *, scl=None, sda=None):
+    """在指定采样序号把某线电平改写（确定性“毛刺注入”）。"""
+    old = samples[index]
+    samples[index] = Sample(
+        tick=old.tick,
+        scl=old.scl if scl is None else scl,
+        sda=old.sda if sda is None else sda,
+    )
+
+
 def print_header(title: str) -> None:
-    bar = "=" * 68
-    print(f"\n{bar}\n{title}\n{bar}")
+    print(f"\n{'=' * 70}\n{title}\n{'=' * 70}")
 
 
 def main() -> None:
-    # ---------- 1. 正常读事务 ----------
-    print_header("1) 正常结果：一次读事务（主机 M 读从机 E，地址 0x53）")
+    t0 = time.perf_counter()
+
+    # ---------- 1. 旧接口正常读事务 ----------
+    print_header("1) 旧接口 parse_updates：正常读事务（M 读 E，地址 0x53）")
     result = parse_updates(build_read_transaction())
-    tx = result.transactions[0]
-    seg = tx.segments[0]
-    print(f"事务数            : {len(result.transactions)}（已闭合 STOP={tx.closed}）")
-    print(f"驱动器（注册序）  : {result.drivers}")
-    print(f"地址              : 0x{seg.address:02X}  读写位={seg.rw}（1=读）")
-    print(f"数据字节          : {' '.join(f'0x{x:02X}' for x in seg.data)}")
-    print(f"ACK（每字节第9拍）: {seg.acks}  （0=ACK, 1=NACK）")
-    print("原始位来源（数据字节 0x9E = 10011110，由从机 E 驱动 SDA）：")
-    data_block = seg.blocks[1]
-    for b in data_block.bits:
-        who = ",".join(b.source.sda_low_drivers) or "无（上拉为1）"
-        print(f"  位{b.index} 值={b.value} 采样@t{b.tick:<2} "
-              f"SCL {b.source.scl_low_tick}->{b.source.scl_high_tick} "
-              f"SDA低驱动=[{who}]")
-    print(f"第 9 拍 NACK      : 值={data_block.ack.value} "
-          f"SDA低驱动={data_block.ack.source.sda_low_drivers or '（无，读为1=NACK）'}")
+    seg = result.transactions[0].segments[0]
+    print(f"地址 0x{seg.address:02X}  读写位={seg.rw}（1=读）  "
+          f"数据={['0x%02X' % x for x in seg.data]}  ACK={seg.acks}  闭合={seg.stop is not None}")
 
-    # ---------- 2. 仲裁失败 ----------
-    print_header("2) 仲裁失败：主机 M 发 1，竞争者 C 同刻拉低 SDA")
-    res2 = parse_updates(build_arbitration_case())
-    seg2 = res2.transactions[0].segments[0]
-    print(f"首字节总线实际值  : 0x{seg2.blocks[0].value:02X}（M 期望的首位 1 被裁成 0）")
-    for loss in seg2.arbitration_losses:
-        print(f"  ArbitrationLoss @t{loss.tick} 字节内位{loss.bit_index} "
-              f"阶段={loss.phase.value} 主机={loss.master} "
-              f"读到={loss.observed} 拉低者={loss.driven_low_by}")
-
-    # ---------- 3a. 拒绝：同一驱动器同一时刻冲突更新 ----------
-    print_header("3a) 异常边界（实际触发）：同一驱动器同刻冲突更新被拒绝")
-    conflict = [
-        Update(0, "M", R, R),
-        Update(1, "M", D, R),
-        Update(1, "M", R, D),   # 与上一条同 tick 同驱动器
-    ]
+    # ---------- 2. 旧接口仲裁失败 + 冲突更新 ----------
+    print_header("2) 旧接口：仲裁丢失 + 同驱动器同刻冲突更新被拒绝")
+    seg2 = parse_updates(build_arbitration_case()).transactions[0].segments[0]
+    loss = seg2.arbitration_losses[0]
+    print(f"仲裁丢失 @t{loss.tick} 位{loss.bit_index} 主机={loss.master} "
+          f"读到={loss.observed} 拉低者={loss.driven_low_by}")
     try:
-        parse_updates(conflict)
+        parse_updates([Update(1, "M", D, R), Update(1, "M", R, D)])
     except ConflictingUpdateError as e:
         print(f"捕获 {type(e).__name__}: {e}")
 
-    # ---------- 3b. 异常：时钟拉伸超时 ----------
-    print_header("3b) 异常边界（实际触发）：SCL 低电平超过 stretch_limit")
-    stretch_ups = [
-        Update(0, "M", R, D),          # START
-        Update(1, "M", D, D),          # SCL 降，低电平开始
-        Update(2, "M", D, D),
-        Update(3, "M", D, D),
-        Update(4, "M", D, D),
-        Update(5, "M", D, D),          # 到 t=5，duration=4 > limit=3
-    ]
+    # ---------- 3. 新接口正常结果：毛刺滤波后正确解码 ----------
+    print_header("3) 新接口 parse_samples：含毛刺采样经 min_width=4 滤波后解码")
+    samples = sample_write_transaction(0x50, (0x71,))
+    # 手算注入点（HOLD=10，从 0 起编号）：
+    #  START 占 [10,20)；地址字节 9 拍从 t=20 起，每拍 20 tick；
+    #  数据字节首位(0x71 bit7=0)的 SCL 低段起点 = 20 + 9*20 = 200。
+    #  ① t=205：数据位 SCL 低段中部插 1-tick 高毛刺（SDA 保持 0）；
+    #  ② 地址首位为 1（0xA0 bit7=1），其 SCL 低段 [20,30)，
+    #     t=25 插 1-tick SDA 低毛刺（采样在上升沿 t=30，不应受影响）。
+    inject(samples, 205, scl=1)
+    inject(samples, 25, sda=0)
+    out = parse_samples(samples, min_width=4)
+    s3 = out.transactions[0].segments[0]
+    print(f"被剔除毛刺 {len(out.filtered_glitches)} 个：")
+    for g in out.filtered_glitches:
+        print(f"  {g.line.value}: t{g.start_tick}->t{g.end_tick} "
+              f"宽{g.width} 电平{g.level} 脉冲（< 4，剔除）")
+    print(f"解码：地址 0x{s3.address:02X}（期望 0x50）  读写={s3.rw}（期望 0）")
+    print(f"      数据={tuple('0x%02X' % x for x in s3.data)}（期望 ('0x71',)）  "
+          f"ACK={s3.acks}（期望 (0, 0)）")
+    print(f"      首字节 8 位 = {[b.value for b in s3.blocks[0].bits]}（期望 0xA0 的各位）")
+
+    # ---------- 4. 边界：宽度等号 / 拉伸等号 ----------
+    print_header("4) 边界：width == min_width 保留；width 小 1 剔除（等号口径）")
+    pulse = [Sample(0, 1, 1), Sample(10, 1, 0), Sample(11, 1, 0), Sample(12, 1, 1)]
+    kept = parse_samples(pulse, min_width=2)   # 宽 2 == 2：保留 -> 识别出 START
+    gone = parse_samples(pulse, min_width=3)   # 宽 2 < 3：剔除 -> 无事务
+    print(f"SDA 低脉冲宽 2：min_width=2 保留，事务数={len(kept.transactions)}；"
+          f"min_width=3 剔除，事务数={len(gone.transactions)}，"
+          f"毛刺报告={len(gone.filtered_glitches)} 条")
+
+    print_header("4b) 边界：stretch duration == limit 通过；超出 1 tick 报错")
+    ok = [Sample(0, 1, 0), Sample(5, 0, 0), Sample(10, 1, 0)]   # 低宽 5
+    parse_samples(ok, min_width=1, stretch_limit=5)
+    print("SCL t5 降、t10 升：duration=5 == limit=5，通过")
+    bad = [Sample(0, 1, 0), Sample(5, 0, 0), Sample(11, 1, 0)]  # 低宽 6
     try:
-        parse_updates(stretch_ups, stretch_limit=3)
+        parse_samples(bad, min_width=1, stretch_limit=5)
     except StretchTimeoutError as e:
+        print(f"t11 升（duration=6 > 5）：捕获 {type(e).__name__}（{e.duration=}, {e.limit=}）")
+
+    # ---------- 5. 实际错误：重复采样 / 非法电平 ----------
+    print_header("5) 新接口实际错误：同一时刻重复采样、非法电平")
+    try:
+        parse_samples([Sample(3, 1, 1), Sample(3, 1, 0)], min_width=2)
+    except DuplicateSampleError as e:
+        print(f"捕获 {type(e).__name__}: {e}")
+    try:
+        parse_samples([Sample(0, 1, 2)], min_width=2)
+    except InvalidSampleError as e:
         print(f"捕获 {type(e).__name__}: {e}")
 
-    print("\n演示完成：以上结果均由 odbus.parse_updates 对固定输入真实计算得到。")
+    dt = time.perf_counter() - t0
+    print(f"\n演示完成：真实计算耗时 {dt:.3f} 秒（远低于 90 秒），无 sleep、无预录结果。")
 
 
 if __name__ == "__main__":

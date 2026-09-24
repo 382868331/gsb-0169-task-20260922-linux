@@ -77,6 +77,58 @@ class LimitError(BusTraceError):
         super().__init__(f"{name} 超过接口上限：值={value!r}，上限={limit}")
 
 
+class InvalidSampleError(BusTraceError):
+    """单条采样或采样参数非法。
+
+    Attributes:
+        field: 出错字段名（如 ``"tick"``、``"scl"``、``"min_width"``）。
+        index: 采样在输入序列中的下标（从 0 起），参数级错误时为 ``None``。
+        tick: 相关整数时刻（若适用）。
+        reason: 人类可读的原因说明。
+    """
+
+    def __init__(
+        self,
+        *,
+        field: str,
+        reason: str,
+        index: int | None = None,
+        tick: int | None = None,
+    ) -> None:
+        self.field = field
+        self.reason = reason
+        self.index = index
+        self.tick = tick
+        loc = []
+        if index is not None:
+            loc.append(f"samples[{index}]")
+        if tick is not None:
+            loc.append(f"tick={tick}")
+        prefix = f"非法采样字段 {field!r}"
+        if loc:
+            prefix += "（" + "，".join(loc) + "）"
+        super().__init__(f"{prefix}: {reason}")
+
+
+class DuplicateSampleError(BusTraceError):
+    """同一整数时刻出现了第二条采样（采样时刻必须严格递增）。
+
+    Attributes:
+        tick: 重复的时刻。
+        index: 第二条采样的下标。
+        first_index: 首条同刻采样的下标。
+    """
+
+    def __init__(self, *, tick: int, index: int, first_index: int) -> None:
+        self.tick = tick
+        self.index = index
+        self.first_index = first_index
+        super().__init__(
+            f"tick={tick} 出现重复采样：samples[{first_index}] 与 samples[{index}]"
+            "（同一时刻只能有一条采样）"
+        )
+
+
 class StretchTimeoutError(BusTraceError):
     """事务进行中 SCL 持续为低的时间超过给定阈值。
 

@@ -52,6 +52,53 @@ class Update:
 
 
 @dataclass(frozen=True)
+class Sample:
+    """一个整数时刻对两根线的**采样电平**（线与之后的总线观测值）。
+
+    与 :class:`Update` 的“多驱动器驱动声明”不同，Sample 描述逻辑分析仪视角：
+    ``scl``/``sda`` 为 0/1 整数（1=高/上拉，0=低），相邻采样之间电平零阶保持。
+    采样时刻必须严格递增（同一时刻两条采样视为冲突）。
+    """
+
+    tick: int
+    scl: int
+    sda: int
+
+
+@dataclass(frozen=True)
+class FilteredGlitch:
+    """被最小稳定宽度滤波器剔除的一个短脉冲（亚宽度区间）。
+
+    Attributes:
+        line: 发生在哪根线。
+        start_tick: 短脉冲首个采样到的时刻（原下降/上升沿时刻，滤波不移动时刻）。
+        end_tick: 总线首次恢复为原电平的采样时刻；``width = end_tick - start_tick``。
+        width: 短脉冲宽度（tick 差），严格小于 ``min_width`` 才会被剔除。
+        level: 被剔除脉冲的电平（如 SDA 上的低毛刺为 0）。
+    """
+
+    line: Line
+    start_tick: int
+    end_tick: int
+    width: int
+    level: int
+
+
+@dataclass(frozen=True)
+class SampleParseResult:
+    """采样流的解析结果：滤波报告 + 复用事务解码器得到的 :class:`ParseResult`。"""
+
+    result: ParseResult
+    min_width: int
+    filtered_glitches: tuple[FilteredGlitch, ...]
+
+    @property
+    def transactions(self) -> tuple[Transaction, ...]:
+        """透传 :attr:`result` 的事务元组，便于直接使用。"""
+        return self.result.transactions
+
+
+@dataclass(frozen=True)
 class BitSource:
     """某一位的原始来源信息（题目要求“输出原始位来源”）。"""
 
