@@ -3,21 +3,30 @@
 
 运行：python demo.py
 
-三部分：
-1. 正常读事务：主机 M 读从机 E（地址 0x53）的数据 0x9E，含每一位的原始来源；
-2. 仲裁失败：主机 M 发送 1 却被竞争者 C 拉低，解析出 ArbitrationLoss；
-3. 异常边界（实际触发，非模拟）：
-   a. 同一驱动器同一时刻两条更新 -> ConflictingUpdateError；
-   b. SCL 持续低超过阈值 -> StretchTimeoutError。
+两部分：
+A. 旧驱动器级接口（parse_updates）：
+   1. 正常读事务：主机 M 读从机 E（地址 0x53）的数据 0x9E，含每一位的原始来源；
+   2. 仲裁失败：主机 M 发送 1 却被竞争者 C 拉低，解析出 ArbitrationLoss；
+   3. 异常边界（实际触发，非模拟）：冲突更新 / SCL 拉伸超时。
+
+B. 新线采样接口（parse_samples，整数时间戳 SCL/SDA）：
+   4. 干净线采样解析出写事务；
+   5. 最小稳定宽度滤波：SCL 毛刺（否则位错位）与 SCL 高时的 SDA 毛刺
+      （否则伪造 STOP/START）都被剔除；
+   6. 阈值等号边界：宽度 == min_width 的脉冲保留；
+   7. 实际错误：同一时刻重复采样被拒绝。
 """
 
 from __future__ import annotations
 
-from odbus import Drive, Update, parse_updates
-from odbus.errors import ConflictingUpdateError, StretchTimeoutError
+from odbus import SAMPLE_DRIVER, Drive, Sample, Update, parse_samples, parse_updates
+from odbus.errors import ConflictingUpdateError, DuplicateSampleError, StretchTimeoutError
 
 R = Drive.RELEASE
 D = Drive.LOW
+
+# 线采样演示统一的最小稳定宽度（tick）。
+MIN_W = 3
 
 
 class Wave:
@@ -124,6 +133,49 @@ def print_header(title: str) -> None:
     print(f"\n{bar}\n{title}\n{bar}")
 
 
+class SampleWave:
+    """线采样波形构建器：每个 SCL 相宽度 = MIN_W（真实信号压住等号边界）。"""
+
+    def __init__(self) -> None:
+        self.t = 0
+        self.scl = self.sda = 1
+        self.samples: list[Sample] = []
+
+    def set(self, scl: int, sda: int) -> None:
+        if (scl, sda) != (self.scl, self.sda):
+            self.samples.append(Sample(self.t, scl, sda))
+            self.scl, self.sda = scl, sda
+
+    def advance(self, n: int = MIN_W) -> None:
+        self.t += n
+
+    def start(self) -> None:
+        self.set(1, 0)          # SCL 高时 SDA 1->0
+        self.advance()
+
+    def pulse(self, sda: int) -> None:
+        self.set(0, sda)       # SCL 降，放好数据
+        self.advance()
+        self.set(1, sda)       # SCL 升，采样
+        self.advance()
+
+    def byte(self, value: int, ack: int) -> None:
+        for k in range(8):
+            self.pulse((value >> (7 - k)) & 1)
+        self.pulse(ack)
+
+
+def build_sample_write(addr7: int, data: tuple[int, ...]) -> list[Sample]:
+    """线采样写事务：START + 地址(写,ACK=0) + 数据(ACK=0) + STOP。"""
+    w = SampleWave()
+    w.start()
+    w.byte((addr7 << 1) | 0, 0)
+    for v in data:
+        w.byte(v, 0)
+    w.set(1, 1)               # SCL 高时 SDA 0->1 => STOP
+    return w.samples
+
+
 def main() -> None:
     # ---------- 1. 正常读事务 ----------
     print_header("1) 正常结果：一次读事务（主机 M 读从机 E，地址 0x53）")
@@ -182,7 +234,76 @@ def main() -> None:
     except StretchTimeoutError as e:
         print(f"捕获 {type(e).__name__}: {e}")
 
-    print("\n演示完成：以上结果均由 odbus.parse_updates 对固定输入真实计算得到。")
+    # ============================================================
+    # B. 线采样输入（整数时间戳 SCL/SDA）+ 最小稳定宽度滤波
+    # ============================================================
+
+    # ---------- 4. 正常：干净线采样 -> 写事务 ----------
+    print_header("4) 线采样正常结果：SCL/SDA 整数时间戳采样，解析写事务 0x50 <- 0xA5")
+    clean = build_sample_write(0x50, (0xA5,))
+    res4 = parse_samples(clean, MIN_W)
+    seg = res4.transactions[0].segments[0]
+    print(f"采样条数          : {len(clean)}（每个 SCL 相宽 {MIN_W} tick == min_width，保留）")
+    print(f"被滤毛刺          : {len(res4.filtered)} 个")
+    print(f"地址/读写/数据    : 0x{seg.address:02X} rw={seg.rw} "
+          f"data={tuple(hex(x) for x in seg.data)} ACK={seg.acks} 闭合={seg.closed}")
+
+    # ---------- 5a. SCL 毛刺：不滤波位错位，滤波后干净 ----------
+    print_header("5a) 滤波：START 后 SCL 上 1-tick 低毛刺（未滤波会错位，滤波后剔除）")
+    glitchy_scl = [clean[0], Sample(1, 0, 0), Sample(2, 1, 0)] + clean[1:]
+    bad = parse_updates([
+        Update(s.tick, SAMPLE_DRIVER,
+               R if s.scl else D, R if s.sda else D)
+        for s in glitchy_scl
+    ])
+    print(f"不滤波首字节      : 0x{bad.transactions[0].segments[0].blocks[0].value:02X}"
+          f"（错误，毛刺被当成一个 SCL 脉冲）")
+    res5a = parse_samples(glitchy_scl, MIN_W)
+    g = res5a.filtered[0]
+    print(f"滤波剔除          : {g.line.value} 短脉冲 t{g.begin_tick}->t{g.end_tick} "
+          f"宽 {g.duration} < {MIN_W}")
+    s5 = res5a.transactions[0].segments[0]
+    print(f"滤波后首字节/数据 : 0x{s5.blocks[0].value:02X} "
+          f"data={tuple(hex(x) for x in s5.data)}（正确 0xA0 / 0xA5）")
+
+    # ---------- 5b. SDA 毛刺：不滤波伪造 STOP/START，滤波后单事务 ----------
+    print_header("5b) 滤波：SCL 高时 SDA 1-tick 跳高毛刺（未滤波伪造 STOP+START）")
+    only_addr = build_sample_write(0x50, ())
+    before = only_addr[:-1]
+    lt = before[-1].tick
+    glitchy_sda = before + [
+        Sample(lt + 1, 1, 1),   # 宽 1 跳高（未滤波视为 STOP）
+        Sample(lt + 2, 1, 0),   # 回低（未滤波视为再次 START）
+        Sample(lt + 3, 1, 1),   # 真正 STOP
+    ]
+    n_bad_tx = len(parse_updates([
+        Update(s.tick, SAMPLE_DRIVER, R if s.scl else D, R if s.sda else D)
+        for s in glitchy_sda
+    ]).transactions)
+    res5b = parse_samples(glitchy_sda, MIN_W)
+    print(f"不滤波事务数      : {n_bad_tx}（毛刺被误判成 STOP+START，事务被劈开）")
+    print(f"滤波后事务/段数   : {len(res5b.transactions)} / "
+          f"{len(res5b.transactions[0].segments)}（仍为单事务单段）")
+    print(f"被滤毛刺          : {res5b.filtered[0].line.value} "
+          f"宽 {res5b.filtered[0].duration} 的高脉冲，剔除后两侧低电平合并")
+
+    # ---------- 6. 等号边界：宽度 == min_width 保留，再窄 1 tick 剔除 ----------
+    print_header("6) 阈值等号边界：width == min_width 保留；width == min_width-1 剔除")
+    kept = parse_samples([Sample(0, 1, 0), Sample(MIN_W, 1, 1)], MIN_W)
+    dropped = parse_samples([Sample(0, 1, 0), Sample(MIN_W - 1, 1, 1)], MIN_W)
+    print(f"低宽 {MIN_W} (==min_width): 事务数={len(kept.transactions)}（START/STOP 保留）")
+    print(f"低宽 {MIN_W - 1} (<min_width) : 事务数={len(dropped.transactions)}，"
+          f"剔除毛刺 {len(dropped.filtered)} 个（不产生 START/STOP）")
+
+    # ---------- 7. 实际错误：同一时刻重复采样 ----------
+    print_header("7) 线采样异常（实际触发）：同一整数时刻重复采样被拒绝")
+    dup = [Sample(0, 1, 1), Sample(1, 0, 1), Sample(1, 1, 0)]
+    try:
+        parse_samples(dup, MIN_W)
+    except DuplicateSampleError as e:
+        print(f"捕获 {type(e).__name__}: {e}")
+
+    print("\n演示完成：以上结果均由 odbus 对固定输入真实计算得到（无 sleep、无预录结果）。")
 
 
 if __name__ == "__main__":

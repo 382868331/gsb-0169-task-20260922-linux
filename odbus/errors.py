@@ -67,6 +67,22 @@ class ConflictingUpdateError(BusTraceError):
         )
 
 
+class DuplicateSampleError(BusTraceError):
+    """同一整数时刻出现了第二条线采样（:class:`odbus.Sample`）。
+
+    线采样描述的是总线唯一的线值，一个时刻只能有一条采样；重复（即使数值
+    相同）也会被拒绝，批处理不得隐含二选一（与驱动器更新的冲突规则一致）。
+    """
+
+    def __init__(self, *, tick: int, index: int, first_index: int) -> None:
+        self.tick = tick
+        self.index = index
+        self.first_index = first_index
+        super().__init__(
+            f"tick={tick} 出现重复采样：samples[{first_index}] 与 samples[{index}]"
+        )
+
+
 class LimitError(BusTraceError):
     """输入超过本库公开的接口上限。"""
 

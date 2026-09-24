@@ -1,9 +1,16 @@
 # odbus — 双线开漏总线事务识别模块
 
-面向离线嵌入式协议工程的可复用 Python 库：从各驱动器在整数时刻对 **SCL/SDA** 的
-驱动状态更新（`release` / `low`）出发，按“线与”合并同一时刻更新、识别
-START / STOP / 重复 START、在 SCL 上升沿采样 8 数据位 + 1 ACK、跟踪主机仲裁丢失，
-并在 SCL 低电平持续超过阈值时报告 `stretch_timeout`。
+面向离线嵌入式协议工程的可复用 Python 库。支持两种输入视角：
+
+1. **驱动器级**：各驱动器在整数时刻对 **SCL/SDA** 的驱动状态更新
+   （`release` / `low`），按“线与”合并同一时刻更新；
+2. **线采样级（本轮新增）**：逻辑分析仪/ADC 在整数时间戳采到的 **SCL/SDA
+   线电平**（`Sample(tick, scl, sda)`，0/1），先按**最小稳定宽度**滤掉短脉冲
+   毛刺，再合成驱动器更新送入同一套事务解码器。
+
+两种输入最终都走同一套核心：识别 START / STOP / 重复 START，在 SCL 上升沿
+采样 8 数据位 + 1 ACK，跟踪主机仲裁丢失，并在 SCL 低电平持续超过阈值时报告
+`stretch_timeout`。
 
 这是一个**有限的教学/诊断子集**，只实现本题契约定下的语义，不宣称与任何完整
 行业标准（如 I²C 规范的全部模式）兼容。
@@ -19,14 +26,15 @@ START / STOP / 重复 START、在 SCL 上升沿采样 8 数据位 + 1 ACK、跟�
 ```
 odbus/              本题库（可 import odbus）
   __init__.py        公开接口汇总
-  model.py           数据结构（Update/Bit/ByteBlock/Segment/Transaction/...）
+  model.py           数据结构（Update/Sample/FilteredPulse/Bit/ByteBlock/Segment/...）
   decoder.py         核心算法（parse_updates / BusRecorder）
+  sampling.py        线采样最小稳定宽度滤波 + 接入旧解码器（parse_samples）
   errors.py          错误类型（全部继承 BusTraceError）
   validation.py      输入校验与接口上限
 tests/
   reference.py       独立参考实现 + 确定性波形生成器（不 import odbus）
-  test_*.py          手工位序列 / 特性 / 差分 / 仲裁 / 校验测试
-demo.py             固定输入演示
+  test_*.py          手工位序列 / 特性 / 差分 / 仲裁 / 校验 / 线采样滤波测试
+demo.py             固定输入演示（驱动器级 + 线采样级两部分）
 ```
 
 ## 运行命令
@@ -35,7 +43,7 @@ demo.py             固定输入演示
 # 测试（题目指定）
 python -m unittest discover -s tests -v
 
-# 演示（约 0.05 秒，远低于 8 秒；真实计算，无 sleep、无预录结果）
+# 演示（约 0.05 秒，远低于 90 秒；真实计算，无 sleep、无预录结果）
 python demo.py
 ```
 
@@ -72,6 +80,53 @@ result = parse_updates(updates, stretch_limit=None)
 - 纯函数：失败时整体抛错，不返回部分结果；`BusRecorder` 在非法 `add` 时拒绝录入，
   不产生未说明的部分变更，且可对同批记录重复 `build()`。
 
+### 线采样输入（本轮新增）
+
+```python
+from odbus import Sample, parse_samples, filter_samples, samples_to_updates
+
+Sample(tick: int, scl: int, sda: int)   # tick 非递减，同 tick 只允许一条；scl/sda ∈ {0,1}
+```
+
+`Sample` 是已经线与后的**线电平**（0=低，1=高），不携带驱动器归属；只在任一根线
+电平变化的时刻给样即可（保持的 tick 不用重复给）。`tick` 值域同 `Update`
+（`[0, 1e9]`，拒绝 float/bool/NaN），同 tick 两条采样抛 `DuplicateSampleError`。
+
+```python
+result = parse_samples(samples, min_width, *, stretch_limit=None)
+```
+
+- `min_width: int`（**位置必填**，正整数，上限 2^31−1）：最小稳定宽度。
+  一段电平从 `begin` 持续到 `end` 的宽度为 `end - begin`；**`width < min_width`
+  的段作为毛刺剔除，`width == min_width` 的段保留**（等号边界）。
+- 返回 `SampleParseResult`：`.result` 是标准 `ParseResult`；`.filtered` 是被剔除的
+  `FilteredPulse`（`line/level/begin_tick/end_tick/duration`，按 begin_tick 排序）；
+  `.min_width`。事务字段通过 `.result` 或便捷属性（`.transactions` 等）读取。
+- 也可单独调用：
+  - `filter_samples(samples, min_width) -> SampleFilterResult`（只滤波，不解析）；
+  - `samples_to_updates(samples) -> list[Update]`（不滤波直接合成，虚拟驱动器名
+    由公开常量 `SAMPLE_DRIVER`（`"SAMPLE"`）给出）。
+- `stretch_limit` 作用在**滤波后**的波形上；被滤掉的 SCL 低毛刺不会触发拉伸检查。
+- 纯函数，失败整体抛错、不修改输入、不产生半更新状态。
+
+#### 滤波规则（写清的固定规则）
+
+1. 对 **SCL、SDA 各自独立**处理（一根线的剔除不改变另一根）。
+2. 把单线阶跃切成相邻且电平严格交替的恒定段；**流首之前缺省为高的空闲段、
+   流末开放段（没有结束时刻）宽度视为无穷**，只吸收相邻毛刺，自身永不被删。
+3. 反复取当前**宽度最小**（等宽取开始最早）的有限段：
+   - 宽度已 `>= min_width`：连最窄段都达标，剩余段全部达标，停止；
+   - 宽度 `< min_width`：判为毛刺，记录后删除；它左右两段电平相同，将二者
+     **合并成一段**，按合并后的新宽度继续。
+4. 这样可跨过毛刺把两侧同电平桥接（如真实低电平中间夹一个宽 1 高尖峰，剔除后
+   低段合并为一个宽低段）。删除优先级是全序（宽度→开始时刻），**结果唯一、与
+   扫描方向无关**；实现为最小堆 + 双向链表，O(n log n)。
+5. **同刻变化**：滤波后两线在同一 tick 的存活阶跃取并集，合并为同一条 `Sample`
+   （“先合并再判边沿”）；若同刻 SCL 也跳变则不构成 START/STOP（同旧规则）。
+
+> 说明：朴素“按时间顺序遇到短段就删”的规则在相邻多个亚阈值段时结果依赖删除
+> 顺序、不唯一；本库采用上述全序规则保证确定性与毛刺桥接。
+
 ### 输出（`ParseResult`）
 
 - `transactions: tuple[Transaction, ...]`
@@ -84,6 +139,8 @@ result = parse_updates(updates, stretch_limit=None)
 - `ByteBlock`：`value`（MSB first 的 8 位）、`bits[8]`、`ack`，每个 `Bit` 带
   `phase`（address/rw/ack_addr/data/ack_data）与 `BitSource` 原始来源：
   SCL 下降/上升时刻、SCL 下降时拉低 SCL 的驱动器、采样时刻拉低 SDA 的驱动器。
+  （线采样输入只有一个虚拟驱动器 `SAMPLE_DRIVER`，故来源驱动器恒为它，
+  且采样输入不产生仲裁丢失——无法区分主机与竞争者。）
 - 顶层另有 `drivers`（首次出现顺序）、`final_scl/final_sda`、`span_ticks`。
 
 ### 错误语义
@@ -92,6 +149,7 @@ result = parse_updates(updates, stretch_limit=None)
 |---|---|
 | `InvalidUpdateError` | 字段类型/值域错误；带 `field/index/tick/driver/reason` 可定位字段 |
 | `ConflictingUpdateError` | 同一驱动器同一时刻出现第二条更新（含完全重复） |
+| `DuplicateSampleError` | 同一整数时刻出现第二条 `Sample`（含完全重复）；带 `tick/index/first_index` |
 | `LimitError` | 超过公开上限（时刻、条数、驱动器数、ID 长度） |
 | `StretchTimeoutError` | SCL 低电平持续严格超过 `stretch_limit`；带 `tick/low_since/duration/limit` |
 
@@ -123,6 +181,10 @@ result = parse_updates(updates, stretch_limit=None)
    阈值”本身就是总线级异常；低电平期间无更新、直到上升沿才超阈值时也会在上升沿补检。
 8. **同刻合并**：先按 tick 分组应用全部驱动器状态，再计算 AND、判边沿与采样，
    严格满足“同刻更新先合并再判断边沿”。
+9. **线采样去毛刺（本轮）**：`parse_samples` 先按“线采样输入”一节的最窄段优先
+   规则对 SCL/SDA 各自滤除 `< min_width` 的段（等号保留、桥接同电平邻居、
+   流首/流末无穷段不删），再合成单一虚拟驱动器的更新复用上述全部语义；
+   `stretch_limit` 在滤波后波形上检查，因此已被滤除的低毛刺不会误报拉伸。
 
 ## 误差口径
 
@@ -138,9 +200,11 @@ result = parse_updates(updates, stretch_limit=None)
 |---|---|
 | `tick` | 0 … 1_000_000_000 |
 | 单次更新条数 | 1_000_000 |
+| 单次采样条数 | 1_000_000 |
 | 不同驱动器数量 | 64 |
 | 驱动器 ID 长度 | 32（非空） |
 | `stretch_limit` | 1 … 2^31−1 |
+| `min_width` | 1 … 2^31−1 |
 
 超限抛 `LimitError` 或 `InvalidUpdateError`。短演示不穷举上限规模。
 
@@ -154,12 +218,30 @@ result = parse_updates(updates, stretch_limit=None)
   由 `tests/reference.py` 中**不导入 odbus** 的独立参考解析器
   （密集 tick 扫描 + 位串累加，与核心的事件分组是两套写法）给出期望值，逐字段对照。
   往返一致只作辅助，不作为期望值来源。
+- `test_sampling.py`（本轮新增）：线采样滤波与接入。
+  - 手算端到端：干净写事务、SCL 毛刺（不滤会位错位）、SCL 高时 SDA 毛刺
+    （不滤会伪造 STOP/START 劈开事务）、重复 START、滤波后拉伸检查与毛刺不触发拉伸；
+  - 边界：`width == min_width` 保留、`width == min_width-1` 剔除、流末开放段不滤、
+    连续毛刺桥接、两线同刻变化合并；
+  - 失败：重复采样（含同值）、非递减、电平 0/1（拒 bool/float/2/-1）、tick 非法、
+    `min_width` 非法、纯函数不改输入不留半更新；
+  - 小规模枚举：LCG 生成两线随机序列 × 4 种宽度，由**不导入 odbus** 的朴素
+    O(n²) 段表参考（最窄段优先 + 邻居合并，与核心的堆+链表是两套写法）给出
+    滤波后采样与毛刺清单，逐项对照。另验证解析关系：所有存活有限段宽度
+    `>= min_width`、滤波幂等。
 
 ## 已知限制
 
-- 不实现完整行业标准的全部内容：没有 10 位地址、时钟同步、通用呼叫、
-  尖峰滤波、SDA 建立/保持时间的物理时序校验；tick 是逻辑整数时刻而非真实时间单位。
+- 不实现完整行业标准的全部物理内容：没有 10 位地址、时钟同步、通用呼叫、
+  SDA 建立/保持时间的物理时序校验；tick 是逻辑整数时刻而非真实时间单位。
+  本轮的“最小稳定宽度”是**离散逻辑电平**的去毛刺，不模拟模拟滞回/RC 整形。
 - 多主机模型只识别“START 发起者”为主机；仲裁失败后不模拟该主机停止驱动后的
   完整状态机切换，只如实记录丢失事件与总线真实采样值。
+- 线采样 `Sample` 已无驱动器归属：滤波/解码结果中来源驱动器恒为虚拟的
+  `SAMPLE_DRIVER`，**采样输入不产生仲裁丢失事件**（无法区分主机与竞争者）；
+  需要仲裁分析请使用驱动器级 `Update` 接口。
 - 未参与任何事务的空闲 SCL 脉冲被忽略；START 前的总线活动不进入事务输出。
-- 更新必须非递减且一次性提供（或经 `BusRecorder` 顺序录入）；不支持乱序插入后重排。
+- 更新/采样必须非递减且一次性提供（更新可经 `BusRecorder` 顺序录入）；
+  不支持乱序插入后重排。
+- 最小稳定宽度是单一全局阈值，对 SCL/SDA 两根线使用同一个 `min_width`，
+  不支持按线分别设置；也不做总线恢复协议、区间时刻的全部解释枚举（本轮范围外）。

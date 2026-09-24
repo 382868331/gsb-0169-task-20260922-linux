@@ -19,6 +19,8 @@ MAX_DRIVER_COUNT = 64
 MAX_DRIVER_ID_LEN = 32
 #: stretch_limit 参数上限。
 MAX_STRETCH_LIMIT = 2**31 - 1
+#: 线采样最小稳定宽度 min_width 参数上限。
+MAX_MIN_WIDTH = 2**31 - 1
 
 
 def is_plain_int(value: Any) -> bool:
@@ -93,3 +95,40 @@ def require_stretch_limit(value: Any) -> int | None:
             reason=f"必须满足 1 <= stretch_limit <= {MAX_STRETCH_LIMIT}，收到 {value}",
         )
     return limit
+
+
+def require_min_width(value: Any) -> int:
+    """线采样滤波的最小稳定宽度：必须为非布尔正整数（宽度 == 该值保留）。"""
+    width = require_int(value, field="min_width")
+    if width < 1 or width > MAX_MIN_WIDTH:
+        raise InvalidUpdateError(
+            field="min_width",
+            reason=f"必须满足 1 <= min_width <= {MAX_MIN_WIDTH}，收到 {value}",
+        )
+    return width
+
+
+def require_level(value: Any, *, field: str, index: int | None = None,
+                  tick: int | None = None) -> int:
+    """线电平只接受整数 0/1；bool/float/其它类型显式拒绝。"""
+    if isinstance(value, bool):
+        raise InvalidUpdateError(
+            field=field,
+            reason="bool 不是合法线电平（True/False 会被拒绝，需要 int 0/1）",
+            index=index,
+            tick=tick,
+        )
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            reason = "数值为 NaN 或 Infinity，线电平必须是整数 0/1"
+        else:
+            reason = "需要 int 0/1，收到 float"
+        raise InvalidUpdateError(field=field, reason=reason, index=index, tick=tick)
+    if value not in (0, 1):
+        raise InvalidUpdateError(
+            field=field,
+            reason=f"线电平必须为 0 或 1，收到 {value!r}",
+            index=index,
+            tick=tick,
+        )
+    return value

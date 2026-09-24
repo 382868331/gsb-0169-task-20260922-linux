@@ -52,6 +52,62 @@ class Update:
 
 
 @dataclass(frozen=True)
+class Sample:
+    """一条线采样：整数时刻 ``tick`` 采到的 SCL/SDA **线电平**（0=低，1=高）。
+
+    与 :class:`Update` 的驱动器视角不同，这是逻辑分析仪/ADC 视角：线值已经是
+    所有驱动器线与后的结果，不携带驱动器归属。采样时刻非递减；同一时刻只允许
+    一条采样（同刻两条采样直接拒绝，不做隐含二选一）。
+
+    只在（任一根线的）电平发生变化的时刻给出采样即可；电平保持的 tick 无需
+    重复给样。脉冲宽度由相邻变化时刻之差确定。
+    """
+
+    tick: int
+    scl: int   # 0 或 1（bool 会被显式拒绝）
+    sda: int   # 0 或 1（bool 会被显式拒绝）
+
+
+@dataclass(frozen=True)
+class FilteredPulse:
+    """一个被最小稳定宽度滤波剔除的窄脉冲（单线视角）。
+
+    Attributes:
+        line: 发生在哪根线（:attr:`Line.SCL` / :attr:`Line.SDA`）。
+        level: 该短区间内短暂采到的电平（0=被拉低的毛刺，1=短暂跳高）。
+        begin_tick: 短区间开始时刻（进入 ``level`` 的采样时刻）。
+        end_tick: 短区间结束时刻（恢复到稳定电平的采样时刻）。
+        duration: 短区间宽度 ``end_tick - begin_tick``，严格小于 ``min_width``。
+    """
+
+    line: Line
+    level: int
+    begin_tick: int
+    end_tick: int
+    duration: int
+
+    @property
+    def tick(self) -> int:
+        """检测（剔除生效）时刻，即短区间结束时刻，便于定位。"""
+        return self.end_tick
+
+
+@dataclass(frozen=True)
+class SampleFilterResult:
+    """:func:`odbus.filter_samples` 的结果。
+
+    Attributes:
+        samples: 滤波重建后的采样序列（SCL/SDA 各自分段恒定期望的阶跃时刻并集）。
+        filtered: 被剔除的窄脉冲，按 ``(begin_tick, 线)`` 排序。
+        min_width: 本次使用的最小稳定宽度（宽度 == 该值的区间保留）。
+    """
+
+    samples: tuple[Sample, ...]
+    filtered: tuple[FilteredPulse, ...]
+    min_width: int
+
+
+@dataclass(frozen=True)
 class BitSource:
     """某一位的原始来源信息（题目要求“输出原始位来源”）。"""
 
