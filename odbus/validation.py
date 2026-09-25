@@ -19,6 +19,8 @@ MAX_DRIVER_COUNT = 64
 MAX_DRIVER_ID_LEN = 32
 #: stretch_limit 参数上限。
 MAX_STRETCH_LIMIT = 2**31 - 1
+#: 恢复操作 max_pulses 参数上限（题面契约的默认/典型值为 9）。
+MAX_RECOVERY_PULSES = 64
 
 
 def is_plain_int(value: Any) -> bool:

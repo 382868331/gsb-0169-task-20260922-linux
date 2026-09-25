@@ -77,6 +77,41 @@ class LimitError(BusTraceError):
         super().__init__(f"{name} 超过接口上限：值={value!r}，上限={limit}")
 
 
+class BusStuckError(BusTraceError):
+    """恢复操作已发满允许的最大 SCL 脉冲数，SDA 仍被拉低（bus_stuck）。
+
+    Attributes:
+        host: 发起恢复的主机驱动器标识。
+        tick: 检测到卡住的时刻（最后一个有效脉冲的上升沿）。
+        pulses: 已完成的有效脉冲数（等于 ``max_pulses``）。
+        max_pulses: 本次恢复允许的最大脉冲数。
+        sda_low_drivers: 检测时刻仍把 SDA 拉低的驱动器。
+        record: 截至报错时的恢复记录（含每个有效脉冲与恢复期间采到的位）。
+    """
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        tick: int,
+        pulses: int,
+        max_pulses: int,
+        sda_low_drivers: tuple[str, ...],
+        record: object | None = None,
+    ) -> None:
+        self.host = host
+        self.tick = tick
+        self.pulses = pulses
+        self.max_pulses = max_pulses
+        self.sda_low_drivers = sda_low_drivers
+        self.record = record
+        who = ",".join(sda_low_drivers) or "（未知）"
+        super().__init__(
+            f"bus_stuck: 主机 {host!r} 恢复已发满 {pulses} 个有效 SCL 脉冲"
+            f"（上限 {max_pulses}），到 tick={tick} SDA 仍被 [{who}] 拉低"
+        )
+
+
 class StretchTimeoutError(BusTraceError):
     """事务进行中 SCL 持续为低的时间超过给定阈值。
 

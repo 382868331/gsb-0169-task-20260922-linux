@@ -34,6 +34,7 @@ class BitPhase(Enum):
     ACK_ADDR = "ack_addr"
     DATA = "data"
     ACK_DATA = "ack_data"
+    RECOVERY = "recovery"  # 恢复操作期间采到的位（不属于任何数据字节）
 
 
 @dataclass(frozen=True)
@@ -196,6 +197,64 @@ class Transaction:
         return bool(self.segments) and self.segments[-1].closed
 
 
+class RecoveryOutcome(Enum):
+    """一次总线恢复操作的了结方式。"""
+
+    STOPPED = "stopped"        # SDA 已释放，主机生成了合法 STOP
+    ABORTED = "aborted"        # 其他主机发出 START，恢复中止，正常识别继续
+    INCOMPLETE = "incomplete"  # 更新流结束时恢复未了结（既非 STOP 也非 bus_stuck）
+
+
+@dataclass(frozen=True)
+class RecoveryRequest:
+    """恢复请求：从整数时刻 ``tick`` 起，主机 ``host`` 由恢复驱动器模型接管。
+
+    模型先释放 SDA，再最多发 ``max_pulses`` 个 SCL 脉冲；每个脉冲必须真正
+    观察到 SCL 升高才计数（被他人拉住时沿用 stretch_timeout 语义等待）。
+    """
+
+    host: str
+    tick: int
+    max_pulses: int = 9
+
+
+@dataclass(frozen=True)
+class RecoveryPulse:
+    """恢复期间一个**有效** SCL 脉冲（已真正观察到 SCL 升高）。"""
+
+    index: int          # 第几个有效脉冲（1 起）
+    fall_tick: int      # 主机拉低 SCL 的时刻
+    rise_tick: int      # 实际观察到 SCL 升高的时刻（脉冲计数时刻）
+    sda: int            # 该上升沿采到的 SDA 线值
+    stretched: bool     # 上升前是否因他人拉低 SCL 而等待过
+
+
+@dataclass
+class RecoveryRecord:
+    """一次恢复操作的记录（结果挂在 ``ParseResult.recoveries`` 上）。"""
+
+    host: str
+    request_tick: int
+    max_pulses: int
+    pulses: list[RecoveryPulse] = field(default_factory=list)
+    bits: list[Bit] = field(default_factory=list)  # 恢复期间采到的位（单独标记）
+    outcome: Optional[RecoveryOutcome] = None
+    stop_tick: Optional[int] = None      # outcome=STOPPED 时：生成的 STOP 时刻
+    abort_tick: Optional[int] = None     # outcome=ABORTED 时：他人 START 的时刻
+    aborted_by: tuple[str, ...] = ()     # outcome=ABORTED 时：START 发起者
+
+
+@dataclass(frozen=True)
+class LineSample:
+    """一个事件时刻同刻合并后的实际线值（诊断/测试用，``trace=True`` 时输出）。"""
+
+    tick: int
+    scl: int
+    sda: int
+    scl_low_drivers: tuple[str, ...]  # 该时刻拉低 SCL 的驱动器（空 => 线为高）
+    sda_low_drivers: tuple[str, ...]  # 该时刻拉低 SDA 的驱动器（空 => 线为高）
+
+
 @dataclass(frozen=True)
 class ParseResult:
     """整段更新流的解析结果。"""
@@ -205,6 +264,8 @@ class ParseResult:
     final_scl: int
     final_sda: int
     span_ticks: int  # 最大时刻 - 最小时刻（用于校验回放，不代表严格时序）
+    recoveries: tuple[RecoveryRecord, ...] = ()  # 恢复操作记录（未请求恢复时为空）
+    trace: tuple[LineSample, ...] = ()           # 逐事件线值（trace=True 时输出）
 
     def all_segments(self) -> tuple[Segment, ...]:
         return tuple(s for t in self.transactions for s in t.segments)
