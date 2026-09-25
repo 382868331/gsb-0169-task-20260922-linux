@@ -93,3 +93,54 @@ def require_stretch_limit(value: Any) -> int | None:
             reason=f"必须满足 1 <= stretch_limit <= {MAX_STRETCH_LIMIT}，收到 {value}",
         )
     return limit
+
+
+def require_recovery_requests(value: Any) -> tuple:
+    """校验 recoveries 参数：RecoveryRequest 的可选可迭代对象，返回按 tick 排序的元组。
+
+    同一时刻至多一个恢复请求（批处理不隐含二选一）；不同请求的 (tick, master)
+    不得完全重复。恢复请求本身不允许 bool/NaN 等伪整数（经 require_tick 校验）。
+    """
+    from .model import RecoveryRequest
+
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not hasattr(value, "__iter__"):
+        raise InvalidUpdateError(
+            field="recoveries",
+            reason=f"必须为 RecoveryRequest 的可迭代对象，收到 {type(value).__name__}",
+        )
+    reqs: list[RecoveryRequest] = []
+    seen: set[tuple[int, str]] = set()
+    for idx, r in enumerate(value):
+        if not isinstance(r, RecoveryRequest):
+            raise InvalidUpdateError(
+                field="recoveries",
+                reason=f"recoveries[{idx}] 必须为 RecoveryRequest，收到 {type(r).__name__}",
+                index=idx,
+            )
+        tick = require_tick(r.tick, index=idx)
+        master = require_driver_id(r.master, index=idx, tick=tick)
+        start_tick = r.start_tick
+        if start_tick is not None:
+            start_tick = require_int(start_tick, field="start_tick", index=idx, tick=tick)
+        req = RecoveryRequest(tick=tick, master=master, start_tick=start_tick)
+        key = (tick, master)
+        if key in seen:
+            raise InvalidUpdateError(
+                field="recoveries",
+                reason=f"recoveries[{idx}] 与前一请求完全重复：tick={tick}, master={master!r}",
+                index=idx,
+                tick=tick,
+                driver=master,
+            )
+        seen.add(key)
+        reqs.append(req)
+    reqs.sort(key=lambda r: r.tick)
+    ticks = [r.tick for r in reqs]
+    if len(set(ticks)) != len(ticks):
+        raise InvalidUpdateError(
+            field="recoveries",
+            reason="同一整数时刻至多允许一个恢复请求（不同主机也不行）",
+        )
+    return tuple(reqs)

@@ -3,18 +3,33 @@
 
 运行：python demo.py
 
-三部分：
+四部分：
 1. 正常读事务：主机 M 读从机 E（地址 0x53）的数据 0x9E，含每一位的原始来源；
 2. 仲裁失败：主机 M 发送 1 却被竞争者 C 拉低，解析出 ArbitrationLoss；
 3. 异常边界（实际触发，非模拟）：
    a. 同一驱动器同一时刻两条更新 -> ConflictingUpdateError；
    b. SCL 持续低超过阈值 -> StretchTimeoutError。
+4. 显式总线恢复（recoveries）：
+   a. SDA 在第 8 个**有效**脉冲后释放 -> 逐事件线值 + 合法 STOP；
+   b. 九个有效脉冲后 SDA 仍低 -> BusStuckError；
+   c. SCL 被别的驱动器无限拉住 -> 恢复期间沿用 stretch_limit 报 StretchTimeoutError；
+   d. 其他主机发 START -> 恢复中止，它的事务被正常识别（不抢占）。
 """
 
 from __future__ import annotations
 
-from odbus import Drive, Update, parse_updates
-from odbus.errors import ConflictingUpdateError, StretchTimeoutError
+from odbus import (
+    Drive,
+    RecoveryEventKind,
+    RecoveryRequest,
+    Update,
+    parse_updates,
+)
+from odbus.errors import (
+    BusStuckError,
+    ConflictingUpdateError,
+    StretchTimeoutError,
+)
 
 R = Drive.RELEASE
 D = Drive.LOW
@@ -124,6 +139,36 @@ def print_header(title: str) -> None:
     print(f"\n{bar}\n{title}\n{bar}")
 
 
+# ---------------- 显式恢复波形 ----------------
+
+def stuck_prefix():
+    """M 发 START 后地址位收到一半（1,0,0），SDA 被卡死在低电平。返回 (updates, req_tick)。"""
+    ups = [Update(0, "M", R, D)]
+    t = 1
+    for b in (1, 0, 0):
+        ups += [Update(t, "M", D, R if b else D)]
+        t += 1
+        ups += [Update(t, "M", R, R if b else D)]
+        t += 1
+    # 请求刻必须有（其他驱动器的）外部更新：从机 X 在此刻声明拉住 SDA。
+    ups.append(Update(t, "X", R, D))
+    return ups, t
+
+
+def print_recovery_events(rec, *, max_rows=None) -> None:
+    print("逐事件（实际线值 = 全部驱动器含恢复模型的线与）：")
+    evs = rec.events if max_rows is None else rec.events[:max_rows]
+    for e in evs:
+        p = f" 脉冲#{e.pulse}" if e.pulse else ""
+        scl_who = ",".join(e.scl_low_drivers) or "-"
+        sda_who = ",".join(e.sda_low_drivers) or "-"
+        print(f"  t{e.tick:<3} {e.kind.value:<15} SCL={e.scl}(低:{scl_who}) "
+              f"SDA={e.sda}(低:{sda_who}){p}")
+    if max_rows is not None and len(rec.events) > max_rows:
+        print(f"  ...（共 {len(rec.events)} 个事件，省略其余）")
+    print("恢复期间单独标记的位：", [(b.pulse, b.value) for b in rec.bits])
+
+
 def main() -> None:
     # ---------- 1. 正常读事务 ----------
     print_header("1) 正常结果：一次读事务（主机 M 读从机 E，地址 0x53）")
@@ -181,6 +226,78 @@ def main() -> None:
         parse_updates(stretch_ups, stretch_limit=3)
     except StretchTimeoutError as e:
         print(f"捕获 {type(e).__name__}: {e}")
+
+    # ---------- 4a. 恢复：第 8 个有效脉冲后 SDA 释放 ----------
+    print_header("4a) 显式恢复：SDA 在第 8 个有效脉冲后释放，生成合法 STOP")
+    ups, t0 = stuck_prefix()
+    # 从机 X 一直拉住 SDA，直到第 8 个脉冲的上升刻（t0 + 16）同刻释放。
+    ups.append(Update(t0 + 16, "X", R, R))
+    result = parse_updates(ups, recoveries=[RecoveryRequest(t0, "M")])
+    rec = result.recoveries[0]
+    seg = result.transactions[0].segments[0]
+    print(f"结局={rec.outcome.value}  实测有效脉冲数={rec.pulses_sent}  "
+          f"STOP@t{rec.stop.tick}  事务闭合={result.transactions[0].closed}")
+    print_recovery_events(rec, max_rows=20)
+    print(f"恢复前半截地址位被冻结（不与恢复位相混）：{[b.value for b in seg.partial_bits]}")
+
+    # ---------- 4b. 恢复：九脉冲后仍不放 SDA -> bus_stuck ----------
+    print_header("4b) 显式恢复：九个有效脉冲后 SDA 仍被拉低 -> bus_stuck")
+    ups, t0 = stuck_prefix()   # X 永不放 SDA、不碰 SCL
+    try:
+        parse_updates(ups, recoveries=[RecoveryRequest(t0, "M")])
+    except BusStuckError as e:
+        print(f"捕获 {type(e).__name__}: {e}")
+        print(f"有效脉冲数={e.pulses}（全 9 个都实测到 SCL 升高），"
+              f"确认时刻=t{e.tick}，SDA 拉低者={e.sda_low_drivers}")
+
+    # ---------- 4c. 恢复：SCL 被无限拉住 -> 恢复期间 stretch_timeout ----------
+    print_header("4c) 显式恢复：SCL 被其他驱动器无限拉住 -> stretch_timeout")
+    ups, t0 = stuck_prefix()
+    # 请求刻 X 同时拉住 SCL 且之后不放：恢复主机放行 SCL 也观察不到升高，脉冲计数为 0。
+    # 把 X 的请求刻状态改成 SCL=LOW（覆盖 4a 里构造的 RELEASE）。
+    ups[-1] = Update(t0, "X", D, D)
+    try:
+        parse_updates(
+            ups, stretch_limit=3, recoveries=[RecoveryRequest(t0, "M")]
+        )
+    except StretchTimeoutError as e:
+        print(f"捕获 {type(e).__name__}: {e}")
+        print(f"有效脉冲数={e.record.pulses_sent}（从未实测到 SCL 升高，一个都不计），"
+              f"结局={e.record.outcome.value}")
+
+    # ---------- 4d. 恢复：其他主机 START 中止 ----------
+    print_header("4d) 显式恢复：第 1 个有效脉冲后其他主机 N 发 START，恢复中止")
+    ups, t0 = stuck_prefix()
+    # X 在第 1 个脉冲上升刻（t0+2）释放 SDA；模型下一拍 idle（t0+3）时 N 发 START。
+    ups += [Update(t0 + 2, "X", R, R), Update(t0 + 3, "N", R, D)]
+    t = t0 + 4
+    # N 发地址字节 0x42<<1|0 = 0x84，ACK=0 由 E 给，然后 STOP。
+    addr = 0x84
+    for k in range(8):
+        b = (addr >> (7 - k)) & 1
+        ups += [Update(t, "N", D, R if b else D), Update(t, "E", R, R)]
+        t += 1
+        ups += [Update(t, "N", R, R if b else D), Update(t, "E", R, R)]
+        t += 1
+    ups += [Update(t, "N", D, R), Update(t, "E", R, D)]
+    t += 1
+    # ACK 上升采样刻 E 仍拉住 SDA => 采样 0（ACK）；N 释放
+    ups += [Update(t, "N", R, R), Update(t, "E", R, D)]
+    t += 1
+    # ACK=0 后 STOP：E 释放 / N 接管（同刻 AND 仍低，无边沿），再 N 释放
+    ups += [Update(t, "N", R, D), Update(t, "E", R, R)]
+    t += 1
+    ups += [Update(t, "N", R, R)]
+    result = parse_updates(ups, recoveries=[RecoveryRequest(t0, "M")])
+    rec = result.recoveries[0]
+    print(f"结局={rec.outcome.value}  中止者={rec.aborted_by}  有效脉冲数={rec.pulses_sent}")
+    last = rec.events[-1]
+    print(f"末事件 t{last.tick} {last.kind.value} SCL={last.scl} SDA={last.sda}")
+    n_tx = result.transactions[-1]
+    n_seg = n_tx.segments[0]
+    print(f"N 的事务被正常识别：地址=0x{n_seg.address:02X} rw={n_seg.rw} "
+          f"ACK={n_seg.acks} STOP={n_tx.closed}；M 的半截事务仍未闭合="
+      f"{not result.transactions[0].closed}")
 
     print("\n演示完成：以上结果均由 odbus.parse_updates 对固定输入真实计算得到。")
 

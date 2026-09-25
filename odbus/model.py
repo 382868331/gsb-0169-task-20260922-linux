@@ -36,6 +36,37 @@ class BitPhase(Enum):
     ACK_DATA = "ack_data"
 
 
+class RecoveryOutcome(Enum):
+    """一次总线恢复的结局。"""
+
+    STOP_GENERATED = "stop_generated"      # SDA 释放后由恢复模型生成合法 STOP
+    STOP_OBSERVED = "stop_observed"        # 恢复期间总线自然出现合法 STOP（SCL 高时 SDA 0->1）
+    ABORTED = "aborted"                    # 其他主机发起 START，恢复中止，正常识别继续
+    STUCK = "stuck"                        # 9 个有效脉冲后 SDA 仍被拉低（bus_stuck）
+    STRETCH_TIMEOUT = "stretch_timeout"    # 等 SCL 升高期间触发 stretch_timeout（记录保留在异常上）
+
+
+class RecoveryEventKind(Enum):
+    """恢复期间逐时刻事件的种类（每个恢复激活的整数时刻恰好一条）。"""
+
+    RELEASE_SDA = "release_sda"            # 主机接管首刻：释放 SDA（SCL 也不主动拉低）
+    PULSE_LOW = "pulse_low"                # 主机拉低 SCL（脉冲起点）
+    WAIT_SCL_LOW = "wait_scl_low"          # 主机已放行 SCL，但实测仍低（被别人拉住，不计脉冲）
+    PULSE_COUNTED = "pulse_counted"        # 实测 SCL 升高，脉冲计数并采样 SDA
+    BUS_IDLE = "bus_idle"                  # SDA 已释放：两线放行观察一拍（让位其他主机 START）
+    STOP_SETUP_LOW = "stop_setup_low"      # 为生成 STOP：SCL 低时把 SDA 拉低
+    STOP_SETUP_RISE = "stop_setup_rise"    # SCL 升高，SDA 保持低
+    STOP_WAIT_SCL = "stop_wait_scl"        # 生成 STOP 过程中 SCL 被别人拉住，继续等
+    STOP_RELEASE = "stop_release"          # SCL 高时释放 SDA => 合法 STOP 边沿
+    STOP_BLOCKED = "stop_blocked"          # 计划释放时 SDA 又被其他驱动器拉低，回去补脉冲
+    STOP_OBSERVED = "stop_observed"        # 总线自然形成的 STOP 被采纳
+    ABORTED = "aborted"                    # 其他主机 START，本刻中止恢复
+
+
+#: 恢复操作最多发送的有效（实测 SCL 确实升高的）SCL 脉冲数。
+MAX_RECOVERY_PULSES = 9
+
+
 @dataclass(frozen=True)
 class Update:
     """一条驱动器更新：驱动器 ``driver`` 在整数时刻 ``tick`` 改变线驱动。
@@ -110,6 +141,94 @@ class StopEvent:
     """STOP（SCL 高时 SDA 0->1）。"""
 
     tick: int
+
+
+@dataclass(frozen=True)
+class RecoveryRequest:
+    """调用方的一次总线恢复请求。
+
+    Attributes:
+        tick: 请求生效的整数时刻；恢复驱动器从该时刻起接管 ``master`` 的线驱动
+            （先释放 SDA）。该时刻必须存在至少一条外部更新（恢复状态机按有更新的
+            时刻推进，不凭空生成时刻）。
+        master: 执行恢复的驱动器标识；通常是被卡住事务的段主机。
+        start_tick: 恢复前最近一次 SCL 下降沿时刻（可选，仅用于溯源）。
+    """
+
+    tick: int
+    master: str
+    start_tick: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class RecoveryBit:
+    """恢复期间某个**有效脉冲**上升沿采到的一位（单独标记，绝不拼入数据字节）。
+
+    Attributes:
+        pulse: 第几个有效脉冲，1..9（只有实测 SCL 升高才计数）。
+        value: 采样时刻 SDA 的总线线值（0/1）。
+        tick: 采样时刻（SCL 上升沿）。
+        scl_low_tick: 该脉冲 SCL 下降沿时刻。
+        sda_low_drivers: 采样时刻仍把 SDA 拉低的驱动器（含恢复主机若它在生成 STOP）。
+    """
+
+    pulse: int
+    value: int
+    tick: int
+    scl_low_tick: int
+    sda_low_drivers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RecoveryEvent:
+    """恢复期间逐时刻的一条轨迹事件（用于逐事件核对实际线值与翻转来源）。
+
+    恢复激活期间，每个有更新的整数时刻恰好产生一条事件；``scl``/``sda`` 是
+    **合并所有驱动器（含恢复驱动器模型）之后**的总线实测线值。
+    """
+
+    tick: int
+    kind: RecoveryEventKind
+    scl: int                       # 合并后的实测 SCL（0/1）
+    sda: int                       # 合并后的实测 SDA（0/1）
+    scl_low_drivers: tuple[str, ...]
+    sda_low_drivers: tuple[str, ...]
+    pulse: Optional[int] = None    # kind=PULSE_COUNTED 时的有效脉冲序号
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class RecoveryRecord:
+    """一次恢复操作的完整记录。
+
+    Attributes:
+        request: 对应的恢复请求。
+        outcome: 恢复结局（生成/观察到 STOP、被其他主机 START 中止、bus_stuck）。
+        events: 逐时刻轨迹（恢复激活的每个整数时刻一条）。
+        bits: 各有效脉冲上升沿采到的位，按脉冲序号排列；这些位不属于任何字节。
+        stop: 恢复成功结束时的 STOP 事件（生成或自然观察到）。
+        pulses_sent: 实测 SCL 确实升高的脉冲数（0..9）；被别人拉住 SCL 的拍不计。
+        stuck_tick: outcome=STUCK 时，第 9 个有效脉冲采样确认 SDA 仍低的时刻。
+        aborted_by: outcome=ABORTED 时，发起 START 的其他主机。
+        segment_index: 恢复前正在进行的段在其事务 segments 中的下标（无段为 None）。
+    """
+
+    request: RecoveryRequest
+    outcome: RecoveryOutcome
+    events: tuple[RecoveryEvent, ...]
+    bits: tuple[RecoveryBit, ...]
+    stop: Optional[StopEvent] = None
+    pulses_sent: int = 0
+    end_tick: Optional[int] = None
+    stuck_tick: Optional[int] = None
+    aborted_by: Optional[str] = None
+    segment_index: Optional[int] = None
+
+    @property
+    def succeeded(self) -> bool:
+        """是否以合法 STOP 结束（生成或自然观察到）。"""
+        return self.outcome in (RecoveryOutcome.STOP_GENERATED,
+                                RecoveryOutcome.STOP_OBSERVED)
 
 
 @dataclass(frozen=True)
@@ -205,6 +324,7 @@ class ParseResult:
     final_scl: int
     final_sda: int
     span_ticks: int  # 最大时刻 - 最小时刻（用于校验回放，不代表严格时序）
+    recoveries: tuple[RecoveryRecord, ...] = ()
 
     def all_segments(self) -> tuple[Segment, ...]:
         return tuple(s for t in self.transactions for s in t.segments)
