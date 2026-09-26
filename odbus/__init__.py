@@ -31,6 +31,15 @@ from .model import (
     Update,
 )
 from .decoder import BusRecorder, parse_updates
+from .masters import (
+    DriveTick,
+    DualMasterResult,
+    FirstConflict,
+    StretchEvent,
+    pad_script,
+    run_dual_master,
+    write_script,
+)
 from .validation import (
     MAX_DRIVER_COUNT,
     MAX_DRIVER_ID_LEN,
@@ -49,6 +58,9 @@ __all__ = [
     "BusTraceError",
     "ConflictingUpdateError",
     "Drive",
+    "DriveTick",
+    "DualMasterResult",
+    "FirstConflict",
     "InvalidUpdateError",
     "LimitError",
     "Line",
@@ -61,8 +73,12 @@ __all__ = [
     "Segment",
     "StartEvent",
     "StopEvent",
+    "StretchEvent",
     "StretchTimeoutError",
     "Transaction",
     "Update",
+    "pad_script",
     "parse_updates",
+    "run_dual_master",
+    "write_script",
 ]

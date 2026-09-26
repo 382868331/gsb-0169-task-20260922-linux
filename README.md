@@ -14,6 +14,14 @@ START / STOP / 重复 START、在 SCL 上升沿采样 8 数据位 + 1 ACK、跟�
 - Linux 原生运行；安装 Python 后**无需安装任何其他依赖**
 - 全部离线：无网络、无账号、无硬件、无数据库/中间件/Docker
 
+### venv 准备（可选但推荐）
+
+```bash
+python3.14 -m venv .venv
+source .venv/bin/activate   # 之后命令中的 python 即 3.14.7
+# 无第三方依赖，requirements 无需安装
+```
+
 ## 目录
 
 ```
@@ -21,12 +29,15 @@ odbus/              本题库（可 import odbus）
   __init__.py        公开接口汇总
   model.py           数据结构（Update/Bit/ByteBlock/Segment/Transaction/...）
   decoder.py         核心算法（parse_updates / BusRecorder）
+  masters.py         双主机逐拍驱动仲裁仿真（run_dual_master / write_script）
   errors.py          错误类型（全部继承 BusTraceError）
   validation.py      输入校验与接口上限
 tests/
   reference.py       独立参考实现 + 确定性波形生成器（不 import odbus）
+  reference_dual.py  双主机仿真的独立真值表参考（不 import odbus）
   test_*.py          手工位序列 / 特性 / 差分 / 仲裁 / 校验测试
 demo.py             固定输入演示
+demo_iteration.py   双主机仲裁演示（地址/数据阶段分胜负、完全相同序列）
 ```
 
 ## 运行命令
@@ -35,8 +46,9 @@ demo.py             固定输入演示
 # 测试（题目指定）
 python -m unittest discover -s tests -v
 
-# 演示（约 0.05 秒，远低于 8 秒；真实计算，无 sleep、无预录结果）
+# 演示（均约 0.05 秒，远低于 90 秒；现场真实计算，无 sleep、无预录结果）
 python demo.py
+python demo_iteration.py
 ```
 
 ## 公开接口
@@ -163,3 +175,47 @@ result = parse_updates(updates, stretch_limit=None)
   完整状态机切换，只如实记录丢失事件与总线真实采样值。
 - 未参与任何事务的空闲 SCL 脉冲被忽略；START 前的总线活动不进入事务输出。
 - 更新必须非递减且一次性提供（或经 `BusRecorder` 顺序录入）；不支持乱序插入后重排。
+
+## 双主机逐拍驱动仲裁（masters.py）
+
+在更新流解码之上提供两个开漏主机的逐拍仿真入口：
+
+```python
+from odbus import run_dual_master, write_script, pad_script
+
+result = run_dual_master({
+    "A": write_script(0x50, [0x11, 0x22]),   # 每拍 (scl, sda) 主张：拉低或释放
+    "B": pad_script(write_script(0x51, [0x11, 0x22]), 56),
+}, stretch_limit=None)
+```
+
+语义：
+
+1. **逐拍线与**：每拍两台主机各自主张 SCL/SDA 拉低或释放，总线电平取线与；
+   时钟低电平是所有主机共同释放前的结果（一方持低即拉伸），
+   拉伸以 `StretchEvent`（拉低方/等待方/持续拍数）与仲裁**分开记录**。
+2. **仲裁判定**：SCL 上升沿（有效高电平采样点）上，某主机释放 SDA（发 1）
+   而总线采到 0，即判它仲裁丢失；ACK 位（第 9 拍）与读方向数据位不按
+   发送数据位的规则判定，不会误判。
+3. **失败方离场**：失败方从下一驱动阶段起被强制释放 SCL/SDA，
+   其脚本后续的 STOP 等动作不会打断赢家的事务。
+4. **帧解码复用原逻辑**：START / 重复 START / STOP 与字节重组仍由
+   `parse_updates` 对仲裁后实际生效的更新流完成。
+5. **输出不是布尔值**：`DualMasterResult` 含赢家标识、失败方首次冲突位置
+   （`FirstConflict`：tick / 字节序 / 位序 / 阶段）、赢家事务的完整
+   `ParseResult`、拉伸事件列表与生效更新流。
+
+约束与校验：恰好两个主机、两序列等长且非空（可用 `pad_script` 补齐）、
+每拍为 `DriveTick` 或 `(scl, sda)` 二元组且值为 `Drive` 枚举
+（bool/裸 int 拒绝）；违反即 `InvalidUpdateError`，拍数上限
+`MAX_TICKS = 500_000`（两主机合计受更新条数上限约束）。
+`write_script` 只是演示/测试用的脚本生成辅助，不是协议状态机。
+
+### 双主机场景的已知限制
+
+- 主机脚本为开环逐拍序列：不模拟真实主机“采到 SCL 低就等待”的闭环行为，
+  拉伸场景需在脚本中显式给出等待拍（见 `tests/test_dual_master.py`）。
+- 完全相同的发送序列不产生冲突，`winner/loser` 均为 `None`
+  （无法也无须区分先后）。
+- 失败方离场后的总线只由赢家（及下挂应答方电平）决定；不模拟失败方
+  重新抢占总线的状态机。
