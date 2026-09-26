@@ -27,6 +27,7 @@ from .model import (
     Segment,
     StartEvent,
     StopEvent,
+    TenBitAddress,
     Transaction,
     Update,
 )
@@ -61,6 +62,7 @@ __all__ = [
     "Segment",
     "StartEvent",
     "StopEvent",
+    "TenBitAddress",
     "StretchTimeoutError",
     "Transaction",
     "Update",

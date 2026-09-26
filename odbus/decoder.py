@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable
 
 from .errors import (
@@ -33,6 +33,7 @@ from .model import (
     Segment,
     StartEvent,
     StopEvent,
+    TenBitAddress,
     Transaction,
     Update,
 )
@@ -139,14 +140,18 @@ def _validate_updates(updates: Iterable[Update]) -> list[Update]:
     return result
 
 
-def _data_phase(byte_count: int, bit_in_byte: int) -> BitPhase:
+def _data_phase(byte_count: int, bit_in_byte: int, ten_await_low: bool) -> BitPhase:
     if byte_count == 0:
         return Phase.RW if bit_in_byte == 7 else Phase.ADDRESS
+    if byte_count == 1 and ten_await_low:
+        return Phase.ADDRESS
     return Phase.DATA
 
 
-def _ack_phase(byte_count: int) -> BitPhase:
-    return Phase.ACK_ADDR if byte_count == 0 else Phase.ACK_DATA
+def _ack_phase(byte_count: int, ten_await_low: bool) -> BitPhase:
+    if byte_count == 0 or (byte_count == 1 and ten_await_low):
+        return Phase.ACK_ADDR
+    return Phase.ACK_DATA
 
 
 def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None) -> ParseResult:
@@ -185,6 +190,19 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
     bit_in_byte = 0          # 0..8：数据位计数；8 表示下一个脉冲是 ACK
     pulse: _PendingPulse | None = None
     seg_rw: int | None = None  # 当前段方向（首字节完成后确定）；读段数据位不查主机仲裁
+    # ---- 十位寻址状态（题内形式：首字节 11110 + 高两位 + 方向）----
+    # ten_state: None=未识别/七位, "await_low"=写头已收待低八位,
+    #            "done"=写地址阶段已结束, "read"=读头段
+    ten_state: str | None = None
+    ten_high = 0          # 写头/读头中的地址高两位
+    ten_header_ok = False  # 写头是否被 ACK
+    tx_ten_full: int | None = None  # 本事务内已完成写地址阶段的完整十位地址
+
+    def reset_ten_state() -> None:
+        nonlocal ten_state, ten_high, ten_header_ok
+        ten_state = None
+        ten_high = 0
+        ten_header_ok = False
 
     pscl = psda = _HIGH
     scl_low_since: int | None = None
@@ -243,11 +261,13 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
                 )
                 cur_tx = Transaction(segments=[cur_seg])
                 transactions.append(cur_tx)
+                tx_ten_full = None  # 新事务：不得借用此前事务残留的地址状态
             pending_bits = []
             byte_count = 0
             bit_in_byte = 0
             seg_rw = None
             pulse = None
+            reset_ten_state()
         elif scl_high and psda == _LOW and sda == _HIGH:
             # ---- STOP（干净边界：字节后的残余采样位不作为截断位保留）----
             if cur_seg is not None:
@@ -259,16 +279,20 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
             pulse = None
             cur_seg = None
             cur_tx = None
+            reset_ten_state()
+            tx_ten_full = None  # STOP 结束事务：写地址阶段状态不跨事务保留
         else:
             # ---- SCL 边沿（与 START/STOP 互斥，因后两者要求 SCL 保持高）----
             if pscl == _LOW and scl == _HIGH:
                 # 上升沿：采样。
                 if cur_seg is not None:
                     if bit_in_byte < 8:
-                        phase = _data_phase(byte_count, bit_in_byte)
+                        phase = _data_phase(
+                            byte_count, bit_in_byte, ten_state == "await_low"
+                        )
                         bit_index = bit_in_byte
                     else:
-                        phase = _ack_phase(byte_count)
+                        phase = _ack_phase(byte_count, ten_state == "await_low")
                         bit_index = 8
                     sda_low = tuple(
                         d for d in driver_order if state[d][1] == _LOW
@@ -320,8 +344,11 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
                         for b in data_bits:
                             value = (value << 1) | b.value
                         ack_bit = pending_bits[8]
+                        is_addr = byte_count == 0 or (
+                            byte_count == 1 and ten_state == "await_low"
+                        )
                         block = ByteBlock(
-                            phase=Phase.ADDRESS if byte_count == 0 else Phase.DATA,
+                            phase=Phase.ADDRESS if is_addr else Phase.DATA,
                             value=value,
                             bits=data_bits,
                             ack=ack_bit,
@@ -331,6 +358,44 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
                         cur_seg.blocks.append(block)
                         if byte_count == 0:
                             seg_rw = value & 1  # 首字节完成，确定本段方向
+                            if value & 0xF8 == 0xF0:
+                                # ---- 十位寻址首字节：11110 + 高两位 + 方向 ----
+                                ten_high = (value >> 1) & 0x03
+                                if seg_rw == 0:
+                                    # 写头：随后必须接地址低八位，收全前不算数据。
+                                    ten_state = "await_low"
+                                    ten_header_ok = ack_bit.value == 0
+                                    cur_seg.ten_bit = TenBitAddress(
+                                        high=ten_high, low=None,
+                                        read_header=False, complete=False,
+                                        matched=True, header_block=block,
+                                    )
+                                else:
+                                    # 读头：仅当本事务内已完成同高位写地址阶段才合法。
+                                    matched = (
+                                        ack_bit.value == 0
+                                        and tx_ten_full is not None
+                                        and (tx_ten_full >> 8) == ten_high
+                                    )
+                                    cur_seg.ten_bit = TenBitAddress(
+                                        high=ten_high,
+                                        low=(tx_ten_full & 0xFF) if matched else None,
+                                        read_header=True, complete=matched,
+                                        matched=matched, header_block=block,
+                                    )
+                                    ten_state = "read"
+                        elif byte_count == 1 and ten_state == "await_low":
+                            # ---- 十位地址低八位：写头与低八位均被 ACK 才算收全 ----
+                            complete = ten_header_ok and ack_bit.value == 0
+                            cur_seg.ten_bit = replace(
+                                cur_seg.ten_bit,
+                                low=value,
+                                low_block=block,
+                                complete=complete,
+                            )
+                            if complete:
+                                tx_ten_full = (ten_high << 8) | value
+                            ten_state = "done"
                         pending_bits = []
                         byte_count += 1
                         bit_in_byte = 0

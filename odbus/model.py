@@ -97,6 +97,42 @@ class ByteBlock:
     end_tick: int               # ACK 采样时刻
 
 
+@dataclass
+class TenBitAddress:
+    """题内十位寻址形式的地址状态（首字节前缀 ``11110``）。
+
+    首字节 = ``11110`` + 地址高两位 + 方向位；写方向（R/W=0）之后再接
+    地址低八位。读方向（R/W=1）只发读头，其完整地址必须在**同一事务**内
+    此前已完成的写地址阶段（写头与低八位均收到且均被 ACK）中匹配。
+
+    Attributes:
+        high: 读头/写头中携带的地址高两位（0..3）。
+        low: 地址低八位。写头段来自其后的第二个字节；读头段在匹配成功时
+            取自同事务已完成的写地址阶段；地址未收全/未匹配时为 None。
+        read_header: True 表示本段首字节是读头（R/W=1）。
+        complete: 完整十位地址是否已收全且各地址字节均被 ACK
+            （读头段还要求与先前写地址阶段高位匹配）。
+        matched: 读头是否匹配同事务内已完成的写地址阶段；写头段恒为 True。
+        header_block: 读头/写头字节块。
+        low_block: 低八位地址字节块；尚未收到时为 None。
+    """
+
+    high: int
+    low: Optional[int]
+    read_header: bool
+    complete: bool
+    matched: bool
+    header_block: ByteBlock
+    low_block: Optional[ByteBlock] = None
+
+    @property
+    def value(self) -> Optional[int]:
+        """完整十位地址；未收全或读头未匹配时为 None。"""
+        if not self.complete or self.low is None:
+            return None
+        return (self.high << 8) | self.low
+
+
 @dataclass(frozen=True)
 class StartEvent:
     """START 或重复 START（SCL 高时 SDA 1->0）。"""
@@ -148,6 +184,7 @@ class Segment:
     arbitration_losses: list[ArbitrationLoss] = field(default_factory=list)
     stop: Optional[StopEvent] = None
     ended_by_repeated_start: bool = False
+    ten_bit: Optional[TenBitAddress] = None  # 十位寻址状态；七位寻址时为 None
 
     @property
     def closed(self) -> bool:
@@ -161,10 +198,24 @@ class Segment:
 
     @property
     def address(self) -> Optional[int]:
-        """7 位地址（首字节高 7 位）；无完整首字节时为 None。"""
+        """段地址。
+
+        七位寻址返回首字节高 7 位；十位寻址在地址收全（读头另需匹配同事务
+        已完成的写地址阶段）后返回完整十位地址，未收全时为 None；
+        无完整首字节时为 None。
+        """
         if not self.blocks:
             return None
+        if self.addressing == "ten":
+            return self.ten_bit.value if self.ten_bit is not None else None
         return self.blocks[0].value >> 1
+
+    @property
+    def addressing(self) -> Optional[str]:
+        """寻址形式：``"seven"``（七位）/ ``"ten"``（十位）；无首字节为 None。"""
+        if not self.blocks:
+            return None
+        return "ten" if (self.blocks[0].value & 0xF8) == 0xF0 else "seven"
 
     @property
     def rw(self) -> Optional[int]:
@@ -175,8 +226,37 @@ class Segment:
 
     @property
     def data(self) -> tuple[int, ...]:
-        """首字节之后各完整数据字节的值（地址字节被排除）。"""
+        """各完整数据字节的值（全部地址字节被排除）。
+
+        七位寻址排除首字节；十位写寻址在地址收全后排除写头与低八位两个字节；
+        十位读头匹配成功后排除读头字节。地址未收全（含中途 NACK）或读头未
+        匹配时，后续字节一律不当作数据，返回空元组。
+        """
+        if not self.blocks:
+            return ()
+        if self.addressing == "ten":
+            tb = self.ten_bit
+            if tb is None or not tb.complete:
+                return ()
+            return tuple(b.value for b in self.blocks[1:]) if tb.read_header \
+                else tuple(b.value for b in self.blocks[2:])
         return tuple(b.value for b in self.blocks[1:])
+
+    @property
+    def address_blocks(self) -> tuple[ByteBlock, ...]:
+        """地址字节块（按顺序）。
+
+        七位寻址仅首字节；十位写寻址为写头 + 已收到的低八位；十位读头为读头。
+        各地址字节的 ACK 来源位置可通过 ``block.ack.source`` 取得。
+        """
+        if not self.blocks:
+            return ()
+        if self.addressing != "ten":
+            return (self.blocks[0],)
+        blocks = [self.blocks[0]]
+        if self.ten_bit is not None and self.ten_bit.low_block is not None:
+            blocks.append(self.ten_bit.low_block)
+        return tuple(blocks)
 
     @property
     def acks(self) -> tuple[int, ...]:

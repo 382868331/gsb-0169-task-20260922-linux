@@ -5,6 +5,8 @@
 START / STOP / 重复 START、在 SCL 上升沿采样 8 数据位 + 1 ACK、跟踪主机仲裁丢失，
 并在 SCL 低电平持续超过阈值时报告 `stretch_timeout`。
 
+本版本在基线之上增加**题内十位寻址形式**（见下文“十位寻址”一节）。
+
 这是一个**有限的教学/诊断子集**，只实现本题契约定下的语义，不宣称与任何完整
 行业标准（如 I²C 规范的全部模式）兼容。
 
@@ -27,6 +29,15 @@ tests/
   reference.py       独立参考实现 + 确定性波形生成器（不 import odbus）
   test_*.py          手工位序列 / 特性 / 差分 / 仲裁 / 校验测试
 demo.py             固定输入演示
+demo_iteration.py    十位寻址增量演示（本题）
+```
+
+## 环境准备（venv）
+
+```bash
+# 仓库根目录下；只需 Python 3.14.7 与标准库，无第三方依赖
+python3.14 -m venv .venv
+. .venv/bin/activate        # 或者不激活，直接用 .venv/bin/python
 ```
 
 ## 运行命令
@@ -35,9 +46,32 @@ demo.py             固定输入演示
 # 测试（题目指定）
 python -m unittest discover -s tests -v
 
-# 演示（约 0.05 秒，远低于 8 秒；真实计算，无 sleep、无预录结果）
+# 基线演示（约 0.05 秒；真实计算，无 sleep、无预录结果）
 python demo.py
+
+# 十位寻址增量演示（约 0.06 秒，远低于 90 秒；现场逐拍生成波形并解析）
+python demo_iteration.py
 ```
+
+## 十位寻址（本版增量）
+
+题内十位寻址形式（仅按本题契约实现，不宣称与行业标准的 10 位模式兼容）：
+
+- **首字节**为 `11110` + 地址高两位 + 方向位（R/W）。其余首字节仍按七位旧逻辑解释。
+- **写方向**（R/W=0）：首字节（写头）之后的一个字节是**地址低八位**；
+  写头与低八位都收到且都被 ACK 才算地址收全，之后才是数据字节。
+- **读方向**（R/W=1）：必须先在同一事务内完成写地址阶段（写头 + 低八位均被 ACK），
+  再重复 START 发送**同一高位地址**的读头；读头匹配成功才输出完整十位地址，
+  读头段随后的字节才是（从机发送的）数据。
+- **地址未收全**：写头或低八位被 NACK、或中途 STOP / 重复 START 时，地址状态
+  保持不完整——后续字节一律不当作数据（`Segment.data` 为空），也**不会借用
+  上次事务残留的低八位**（STOP 结束事务后写地址阶段状态即失效，不跨事务保留）。
+- **输出**：`Segment.address` 在地址收全（读头另需匹配）后返回完整十位地址，
+  否则为 `None`；`Segment.addressing` 为 `"seven"` / `"ten"`；
+  `Segment.ten_bit`（`TenBitAddress`）给出高两位、低八位、是否读头、是否收全、
+  是否匹配；`Segment.address_blocks` 按顺序给出各地址字节块，每个地址字节的
+  **ACK 来源位置**经 `block.ack.source`（采样时刻、SCL 脉冲区间、拉低 SDA 的
+  驱动器）取得。
 
 ## 公开接口
 
@@ -81,6 +115,9 @@ result = parse_updates(updates, stretch_limit=None)
     `ended_by_repeated_start`；
   - 便捷属性：`address`（首字节高 7 位）、`rw`（0=写/1=读）、
     `data`（后续数据字节）、`acks`（每字节第 9 拍，0=ACK/1=NACK）、`closed`。
+    十位寻址时 `address` 返回完整十位地址（未收全/读头未匹配为 `None`），
+    `addressing` 为 `"seven"`/`"ten"`，`address_blocks` 给出各地址字节块
+    （其 `ack.source` 即各地址字节的 ACK 来源位置），完整状态见 `ten_bit`。
 - `ByteBlock`：`value`（MSB first 的 8 位）、`bits[8]`、`ack`，每个 `Bit` 带
   `phase`（address/rw/ack_addr/data/ack_data）与 `BitSource` 原始来源：
   SCL 下降/上升时刻、SCL 下降时拉低 SCL 的驱动器、采样时刻拉低 SDA 的驱动器。
@@ -154,10 +191,18 @@ result = parse_updates(updates, stretch_limit=None)
   由 `tests/reference.py` 中**不导入 odbus** 的独立参考解析器
   （密集 tick 扫描 + 位串累加，与核心的事件分组是两套写法）给出期望值，逐字段对照。
   往返一致只作辅助，不作为期望值来源。
+- `test_ten_bit.py`：逐拍生成合法十位写、写后转读、低八位 NACK、错误读头
+  （无写地址阶段 / 高位不匹配 / 跨事务借用 / 写地址阶段未完成即 Sr），对照
+  `tests/reference.py` 中 `ref_ten_bit` 的独立字节状态机，并核对各地址字节的
+  ACK 来源位置；七位地址旧逻辑也回归覆盖。
 
 ## 已知限制
 
-- 不实现完整行业标准的全部内容：没有 10 位地址、时钟同步、通用呼叫、
+- 十位寻址只实现题内形式：首字节 `11110`+高两位+方向、写后接低八位、
+  读须先完成写地址阶段再重复 START 发同高位读头；不实现行业标准 10 位模式的
+  其余细节（如保留地址仲裁交互、全状态机切换）。首字节前缀为 `11110` 的
+  七位保留地址因此一律按十位头解释。
+- 不实现完整行业标准的全部内容：没有时钟同步、通用呼叫、
   尖峰滤波、SDA 建立/保持时间的物理时序校验；tick 是逻辑整数时刻而非真实时间单位。
 - 多主机模型只识别“START 发起者”为主机；仲裁失败后不模拟该主机停止驱动后的
   完整状态机切换，只如实记录丢失事件与总线真实采样值。

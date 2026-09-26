@@ -170,7 +170,8 @@ def gen_scenario(seed: int) -> Scenario:
             else:
                 g.repeated_start()
                 repeated = True
-            addr7 = rnd() & 0x7F
+            # 0x78..0x7B（首字节前缀 11110）已保留给十位寻址头，七位地址避开。
+            addr7 = rnd() % 0x78
             rw = rnd() & 1
             addr_byte = (addr7 << 1) | rw
             seg = RefSeg(addr=addr7, rw=rw, repeated=repeated)
@@ -325,3 +326,82 @@ def ref_simulate(
     if cur_tx is not None:
         completed.append(cur_tx)
     return completed
+
+
+# --------------------------- 十位寻址：独立字节状态机 ---------------------------
+
+@dataclass
+class RefTenSeg:
+    """独立字节状态机对单个段的期望结果（不导入 odbus）。"""
+
+    kind: str                 # "seven" | "ten_write" | "ten_read"
+    address: int | None       # 完整地址（七位或十位）；未收全/未匹配为 None
+    complete: bool            # 十位地址是否收全（七位恒为 True）
+    matched: bool | None      # 读头是否匹配同事务已完成的写地址阶段
+    data: tuple[int, ...]     # 期望数据字节（地址未收全时为空）
+    acks: tuple[int, ...]     # 全部字节的 ACK
+    addr_acks: tuple[int, ...]  # 各地址字节的 ACK（按顺序）
+
+
+def ref_ten_bit(txs: list[list[list[tuple[int, int]]]]) -> list[list[RefTenSeg]]:
+    """按字节流独立重放十位寻址状态机。
+
+    输入：事务 -> 段 -> [(字节值, ACK)]。规则独立重述：
+    - 首字节 ``11110`` + 高两位 + 方向为十位头，其余首字节按七位旧逻辑；
+    - 写头（R/W=0）后一个字节是低八位；写头与低八位均被 ACK 才收全，
+      收全后完整地址在本事务内登记；STOP 后登记失效（不跨事务借用）；
+    - 读头（R/W=1）仅当本事务内已登记同高位完整地址才匹配；
+    - 地址未收全/读头未匹配时，后续字节一律不是数据。
+    """
+    out: list[list[RefTenSeg]] = []
+    for tx in txs:
+        registered: int | None = None  # 本事务内已完成写地址阶段的完整十位地址
+        tx_out: list[RefTenSeg] = []
+        for seg in tx:
+            blocks = list(seg)
+            acks = tuple(a for _, a in blocks)
+            if not blocks:
+                tx_out.append(RefTenSeg("seven", None, False, None, (), (), ()))
+                continue
+            b0, a0 = blocks[0]
+            if b0 & 0xF8 != 0xF0:
+                tx_out.append(RefTenSeg(
+                    "seven", b0 >> 1, True, None,
+                    tuple(v for v, _ in blocks[1:]), acks, (a0,),
+                ))
+                continue
+            high = (b0 >> 1) & 0x03
+            if b0 & 1 == 0:
+                # 写头段
+                if len(blocks) >= 2:
+                    b1, a1 = blocks[1]
+                    complete = (a0 == 0 and a1 == 0)
+                    address = (high << 8) | b1 if complete else None
+                    if complete:
+                        registered = address
+                    data = tuple(v for v, _ in blocks[2:]) if complete else ()
+                    addr_acks = (a0, a1)
+                else:
+                    complete = False
+                    address = None
+                    data = ()
+                    addr_acks = (a0,)
+                tx_out.append(RefTenSeg(
+                    "ten_write", address, complete, None, data, acks, addr_acks,
+                ))
+            else:
+                # 读头段
+                matched = (
+                    a0 == 0
+                    and registered is not None
+                    and (registered >> 8) == high
+                )
+                tx_out.append(RefTenSeg(
+                    "ten_read",
+                    registered if matched else None,
+                    matched, matched,
+                    tuple(v for v, _ in blocks[1:]) if matched else (),
+                    acks, (a0,),
+                ))
+        out.append(tx_out)
+    return out
