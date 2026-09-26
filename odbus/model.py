@@ -32,6 +32,8 @@ class BitPhase(Enum):
     ADDRESS = "address"
     RW = "rw"
     ACK_ADDR = "ack_addr"
+    ADDRESS_LOW = "address_low"
+    ACK_ADDR_LOW = "ack_addr_low"
     DATA = "data"
     ACK_DATA = "ack_data"
 
@@ -148,6 +150,12 @@ class Segment:
     arbitration_losses: list[ArbitrationLoss] = field(default_factory=list)
     stop: Optional[StopEvent] = None
     ended_by_repeated_start: bool = False
+    address_mode: Optional[str] = None  # "7-bit" 或 "10-bit"
+    ten_bit_high: Optional[int] = None
+    ten_bit_low: Optional[int] = None
+    ten_bit_address_complete: bool = False
+    ten_bit_address_acknowledged: bool = False
+    address_blocks: list[ByteBlock] = field(default_factory=list)
 
     @property
     def closed(self) -> bool:
@@ -161,27 +169,51 @@ class Segment:
 
     @property
     def address(self) -> Optional[int]:
-        """7 位地址（首字节高 7 位）；无完整首字节时为 None。"""
+        """完整地址；十位地址未收全或未被 ACK 时为 None。"""
         if not self.blocks:
             return None
+        if self.address_mode == "10-bit":
+            if not self.ten_bit_address_complete or not self.ten_bit_address_acknowledged:
+                return None
+            return ((self.ten_bit_high or 0) << 8) | (self.ten_bit_low or 0)
         return self.blocks[0].value >> 1
 
     @property
     def rw(self) -> Optional[int]:
-        """首字节最低位：0=写，1=读；无法解析时为 None。"""
+        """首字节最低位：0=写，1=读；无首字节时为 None。"""
         if not self.blocks:
             return None
         return self.blocks[0].value & 1
 
     @property
+    def current_address_block_count(self) -> int:
+        """当前段 blocks 开头属于寻址阶段的字节数（不含跨段引用的十位低字节）。"""
+        if not self.blocks:
+            return 0
+        if self.address_mode == "10-bit" and self.rw == 0:
+            if self.ten_bit_address_acknowledged:
+                return min(2, len(self.blocks))
+            return len(self.blocks)
+        if self.address_mode == "10-bit" and self.rw == 1:
+            return len(self.blocks) if not self.ten_bit_address_complete else 1
+        return 1
+
+    @property
     def data(self) -> tuple[int, ...]:
         """首字节之后各完整数据字节的值（地址字节被排除）。"""
-        return tuple(b.value for b in self.blocks[1:])
+        if self.address_mode == "10-bit" and not self.ten_bit_address_acknowledged:
+            return ()
+        return tuple(b.value for b in self.blocks[self.current_address_block_count:])
 
     @property
     def acks(self) -> tuple[int, ...]:
         """每个字节对应的 ACK 值（0=ACK，1=NACK）。"""
         return tuple(b.ack.value for b in self.blocks)
+
+    @property
+    def address_acks(self) -> tuple[Bit, ...]:
+        """所有寻址字节的 ACK 位；十位读段也包含写地址阶段的低字节 ACK。"""
+        return tuple(b.ack for b in self.address_blocks)
 
 
 @dataclass

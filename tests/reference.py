@@ -170,7 +170,7 @@ def gen_scenario(seed: int) -> Scenario:
             else:
                 g.repeated_start()
                 repeated = True
-            addr7 = rnd() & 0x7F
+            addr7 = rnd() % 116  # 116..127 留给十位寻址前缀，基线只生成旧七位地址
             rw = rnd() & 1
             addr_byte = (addr7 << 1) | rw
             seg = RefSeg(addr=addr7, rw=rw, repeated=repeated)

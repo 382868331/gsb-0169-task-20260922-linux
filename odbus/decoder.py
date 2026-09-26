@@ -139,14 +139,34 @@ def _validate_updates(updates: Iterable[Update]) -> list[Update]:
     return result
 
 
-def _data_phase(byte_count: int, bit_in_byte: int) -> BitPhase:
+def _data_phase(segment: Segment, byte_count: int, bit_in_byte: int) -> BitPhase:
     if byte_count == 0:
         return Phase.RW if bit_in_byte == 7 else Phase.ADDRESS
+    if (
+        segment.address_mode == "10-bit"
+        and byte_count >= 1
+        and (
+            (segment.rw == 0 and not segment.ten_bit_address_acknowledged)
+            or (segment.rw == 1 and not segment.ten_bit_address_complete)
+        )
+    ):
+        return Phase.ADDRESS_LOW
     return Phase.DATA
 
 
-def _ack_phase(byte_count: int) -> BitPhase:
-    return Phase.ACK_ADDR if byte_count == 0 else Phase.ACK_DATA
+def _ack_phase(segment: Segment, byte_count: int) -> BitPhase:
+    if byte_count == 0:
+        return Phase.ACK_ADDR
+    if (
+        segment.address_mode == "10-bit"
+        and byte_count >= 1
+        and (
+            (segment.rw == 0 and not segment.ten_bit_address_acknowledged)
+            or (segment.rw == 1 and not segment.ten_bit_address_complete)
+        )
+    ):
+        return Phase.ACK_ADDR_LOW
+    return Phase.ACK_DATA
 
 
 def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None) -> ParseResult:
@@ -185,6 +205,9 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
     bit_in_byte = 0          # 0..8：数据位计数；8 表示下一个脉冲是 ACK
     pulse: _PendingPulse | None = None
     seg_rw: int | None = None  # 当前段方向（首字节完成后确定）；读段数据位不查主机仲裁
+    pending_ten_low: ByteBlock | None = None
+    pending_ten_high: int | None = None
+    pending_ten_write_header: ByteBlock | None = None
 
     pscl = psda = _HIGH
     scl_low_since: int | None = None
@@ -231,11 +254,33 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
             # START 是帧复位：Sr 前未凑满 9 拍的残余采样位直接丢弃，
             # 不带入新段（真正的半截字节只在流末尾截断时保留为 partial_bits）。
             if cur_seg is not None:
+                carried_high = None
+                carried_low = None
+                carried_header = None
+                if (
+                    cur_seg.address_mode == "10-bit"
+                    and cur_seg.rw == 0
+                    and not cur_seg.ten_bit_address_acknowledged
+                    and pending_bits
+                ):
+                    cur_seg.partial_bits = list(pending_bits)
+                if (
+                    cur_seg.address_mode == "10-bit"
+                    and cur_seg.rw == 0
+                    and cur_seg.ten_bit_address_acknowledged
+                ):
+                    carried_high = cur_seg.ten_bit_high
+                    carried_low = pending_ten_low
+                    carried_header = cur_seg.blocks[0]
                 cur_seg.ended_by_repeated_start = True
                 new_seg = Segment(start=StartEvent(tick=tick, repeated=True),
                                   starters=starters_sorted)
                 cur_tx.segments.append(new_seg)
                 cur_seg = new_seg
+                cur_seg.ten_bit_high = carried_high
+                pending_ten_high = carried_high
+                pending_ten_low = carried_low
+                pending_ten_write_header = carried_header
             else:
                 cur_seg = Segment(
                     start=StartEvent(tick=tick, repeated=False),
@@ -243,6 +288,9 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
                 )
                 cur_tx = Transaction(segments=[cur_seg])
                 transactions.append(cur_tx)
+                pending_ten_high = None
+                pending_ten_low = None
+                pending_ten_write_header = None
             pending_bits = []
             byte_count = 0
             bit_in_byte = 0
@@ -259,16 +307,19 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
             pulse = None
             cur_seg = None
             cur_tx = None
+            pending_ten_low = None
+            pending_ten_high = None
+            pending_ten_write_header = None
         else:
             # ---- SCL 边沿（与 START/STOP 互斥，因后两者要求 SCL 保持高）----
             if pscl == _LOW and scl == _HIGH:
                 # 上升沿：采样。
                 if cur_seg is not None:
                     if bit_in_byte < 8:
-                        phase = _data_phase(byte_count, bit_in_byte)
+                        phase = _data_phase(cur_seg, byte_count, bit_in_byte)
                         bit_index = bit_in_byte
                     else:
-                        phase = _ack_phase(byte_count)
+                        phase = _ack_phase(cur_seg, byte_count)
                         bit_index = 8
                     sda_low = tuple(
                         d for d in driver_order if state[d][1] == _LOW
@@ -320,8 +371,13 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
                         for b in data_bits:
                             value = (value << 1) | b.value
                         ack_bit = pending_bits[8]
+                        block_phase = (
+                            Phase.ADDRESS
+                            if byte_count == 0
+                            else _data_phase(cur_seg, byte_count, 0)
+                        )
                         block = ByteBlock(
-                            phase=Phase.ADDRESS if byte_count == 0 else Phase.DATA,
+                            phase=block_phase,
                             value=value,
                             bits=data_bits,
                             ack=ack_bit,
@@ -331,6 +387,65 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
                         cur_seg.blocks.append(block)
                         if byte_count == 0:
                             seg_rw = value & 1  # 首字节完成，确定本段方向
+                            if (value >> 3) & 0x1F == 0b11110:
+                                cur_seg.address_mode = "10-bit"
+                                cur_seg.ten_bit_high = (value >> 1) & 0x03
+                                if seg_rw == 1:
+                                    if (
+                                        pending_ten_write_header is not None
+                                        and pending_ten_low is not None
+                                        and pending_ten_low.ack.value == 0
+                                        and pending_ten_high == cur_seg.ten_bit_high
+                                    ):
+                                        cur_seg.ten_bit_low = pending_ten_low.value
+                                        cur_seg.ten_bit_address_acknowledged = (
+                                            block.ack.value == 0
+                                            and pending_ten_low.ack.value == 0
+                                        )
+                                        cur_seg.ten_bit_address_complete = (
+                                            cur_seg.ten_bit_address_acknowledged
+                                        )
+                                        cur_seg.address_blocks = [
+                                            pending_ten_write_header,
+                                            pending_ten_low,
+                                            block,
+                                        ]
+                                    else:
+                                        cur_seg.ten_bit_address_complete = False
+                                        cur_seg.ten_bit_address_acknowledged = False
+                                        cur_seg.address_blocks = [block]
+                                else:
+                                    cur_seg.address_blocks = [block]
+                            else:
+                                cur_seg.address_mode = "7-bit"
+                                cur_seg.ten_bit_address_complete = True
+                                cur_seg.ten_bit_address_acknowledged = block.ack.value == 0
+                                cur_seg.address_blocks = [block]
+                        elif (
+                            cur_seg.address_mode == "10-bit"
+                            and cur_seg.rw == 0
+                            and not cur_seg.ten_bit_address_acknowledged
+                        ):
+                            cur_seg.address_blocks.append(block)
+                            if byte_count == 1:
+                                cur_seg.ten_bit_low = value
+                                cur_seg.ten_bit_address_acknowledged = (
+                                    cur_seg.blocks[0].ack.value == 0
+                                    and block.ack.value == 0
+                                )
+                                cur_seg.ten_bit_address_complete = (
+                                    cur_seg.ten_bit_address_acknowledged
+                                )
+                                pending_ten_high = cur_seg.ten_bit_high
+                                if cur_seg.ten_bit_address_acknowledged:
+                                    pending_ten_low = block
+                                    pending_ten_write_header = cur_seg.blocks[0]
+                        elif (
+                            cur_seg.address_mode == "10-bit"
+                            and cur_seg.rw == 1
+                            and not cur_seg.ten_bit_address_complete
+                        ):
+                            cur_seg.address_blocks.append(block)
                         pending_bits = []
                         byte_count += 1
                         bit_in_byte = 0
