@@ -29,10 +29,12 @@ from .model import (
     BitSource,
     ByteBlock,
     Drive,
+    IterationResult,
     ParseResult,
     Segment,
     StartEvent,
     StopEvent,
+    StretchEvent,
     Transaction,
     Update,
 )
@@ -139,6 +141,18 @@ def _validate_updates(updates: Iterable[Update]) -> list[Update]:
     return result
 
 
+def _check_conflicts(items: list[Update]) -> None:
+    """同一 (tick, driver) 只允许一条更新（批处理不得隐含二选一）。"""
+    seen_key: dict[tuple[int, str], int] = {}
+    for idx, u in enumerate(items):
+        key = (u.tick, u.driver)
+        if key in seen_key:
+            raise ConflictingUpdateError(
+                tick=u.tick, driver=u.driver, index=idx, first_index=seen_key[key]
+            )
+        seen_key[key] = idx
+
+
 def _data_phase(byte_count: int, bit_in_byte: int) -> BitPhase:
     if byte_count == 0:
         return Phase.RW if bit_in_byte == 7 else Phase.ADDRESS
@@ -159,16 +173,7 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
     """
     stretch_limit = require_stretch_limit(stretch_limit)
     items = _validate_updates(updates)
-
-    # --- 冲突检测：同一 (tick, driver) 只允许一条更新 ---
-    seen_key: dict[tuple[int, str], int] = {}
-    for idx, u in enumerate(items):
-        key = (u.tick, u.driver)
-        if key in seen_key:
-            raise ConflictingUpdateError(
-                tick=u.tick, driver=u.driver, index=idx, first_index=seen_key[key]
-            )
-        seen_key[key] = idx
+    _check_conflicts(items)
 
     # --- 驱动器状态（1=RELEASE，0=LOW），缺省为释放 ---
     state: dict[str, list[int]] = {}
@@ -372,4 +377,167 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
         final_scl=pscl,
         final_sda=psda,
         span_ticks=(items[-1].tick - items[0].tick) if items else 0,
+    )
+
+
+def iterate_masters(
+    intents: Iterable[Update], *, stretch_limit: int | None = None
+) -> IterationResult:
+    """两个（或多个）开漏主机逐拍驱动输入的仲裁迭代。
+
+    输入中每个驱动器都被视为竞争主机，逐拍给出自己对 SCL/SDA 的主张
+    （拉低或释放），总线电平取所有主机的线与：
+
+    * 主机在**主机发送**的数据位（地址/RW 八位，以及写方向数据位）上
+      释放 SDA（发 1），却在 SCL 上升沿的有效高电平采到 0 时，判它仲裁丢失；
+      ACK 位（每字第 9 拍）不按数据位规则判决，读方向数据位也不判决；
+    * 失败方从**下一驱动阶段**起被强制释放两条线：其后续的拉低主张不再
+      作用于总线，因此无法继续制造 STOP 打断赢家；
+    * 时钟低电平取所有主机共同释放后的结果（线与）；部分主机已释放而
+      总线仍被拉低的区间记为 StretchEvent，与仲裁丢失分开记录；
+    * START / 重复 START / STOP 的识别仍交给原解码逻辑：迭代层只合成
+      实际总线更新流，最终事务由 parse_updates 解码得到。
+
+    Args:
+        intents: 各主机按整数时刻非递减排列的逐拍驱动主张（Update，
+            driver 为主机标识）。至少需要两个不同主机。
+        stretch_limit: 透传给 parse_updates 的 SCL 低电平阈值。
+
+    Returns:
+        IterationResult：赢家们、每个失败方的首次冲突位置、
+        拉伸区间、实际总线更新流及赢家的解码事务。
+    """
+    items = _validate_updates(intents)
+    _check_conflicts(items)
+
+    masters: list[str] = []
+    for u in items:
+        if u.driver not in masters:
+            masters.append(u.driver)
+    if len(masters) < 2:
+        raise InvalidUpdateError(
+            field="driver",
+            reason=f"仲裁迭代至少需要两个主机驱动器，实际 {len(masters)} 个",
+        )
+
+    state: dict[str, list[int]] = {m: [_HIGH, _HIGH] for m in masters}
+    losers: dict[str, ArbitrationLoss] = {}  # 每主机只记首次冲突
+    effective: list[Update] = []
+    stretches: list[StretchEvent] = []
+    open_stretch: list | None = None  # [start_tick, holders, released]
+
+    pscl = psda = _HIGH
+    in_seg = False
+    bit_in_byte = 0
+    byte_count = 0
+    seg_rw: int | None = None
+    cur_value = 0  # 当前字节已采样数据位（MSB first）的累计值
+
+    def close_stretch(end_tick: int) -> None:
+        nonlocal open_stretch
+        if open_stretch is not None:
+            start, holders, released = open_stretch
+            stretches.append(
+                StretchEvent(
+                    start_tick=start, end_tick=end_tick,
+                    holders=holders, released=released,
+                )
+            )
+            open_stretch = None
+
+    n = len(items)
+    i = 0
+    while i < n:
+        tick = items[i].tick
+        group = [items[i]]
+        j = i + 1
+        while j < n and items[j].tick == tick:
+            group.append(items[j])
+            j += 1
+        i = j
+
+        # 应用本拍主张：失败方自判决后的下一驱动阶段起强制释放。
+        for u in group:
+            if u.driver in losers:
+                eff_scl = eff_sda = _HIGH
+            else:
+                eff_scl, eff_sda = u.scl.line_level, u.sda.line_level
+            state[u.driver][0] = eff_scl
+            state[u.driver][1] = eff_sda
+            effective.append(
+                Update(
+                    tick=tick,
+                    driver=u.driver,
+                    scl=Drive.RELEASE if eff_scl else Drive.LOW,
+                    sda=Drive.RELEASE if eff_sda else Drive.LOW,
+                )
+            )
+
+        scl = min(state[m][0] for m in masters)
+        sda = min(state[m][1] for m in masters)
+
+        # ---- 位相位跟踪（只为仲裁判决服务；START/STOP 本身由解码层识别）----
+        if pscl == _HIGH and scl == _HIGH and psda == _HIGH and sda == _LOW:
+            in_seg = True
+            bit_in_byte = 0
+            byte_count = 0
+            seg_rw = None
+            cur_value = 0
+        elif pscl == _HIGH and scl == _HIGH and psda == _LOW and sda == _HIGH:
+            in_seg = False
+        elif pscl == _LOW and scl == _HIGH and in_seg:
+            # SCL 上升沿：有效高电平采样。
+            master_sends = byte_count == 0 or seg_rw == 0
+            if bit_in_byte < 8:
+                if master_sends and sda == _LOW:
+                    low_by = tuple(m for m in masters if state[m][1] == _LOW)
+                    for m in masters:
+                        # 发 1（已释放）却采到 0 => 该主机仲裁丢失。
+                        if m not in losers and state[m][1] == _HIGH:
+                            losers[m] = ArbitrationLoss(
+                                tick=tick,
+                                bit_index=bit_in_byte,
+                                phase=_data_phase(byte_count, bit_in_byte),
+                                master=m,
+                                observed=sda,
+                                driven_low_by=tuple(d for d in low_by if d != m),
+                            )
+                cur_value = (cur_value << 1) | sda
+            # ACK 位（第 9 拍）不按数据位规则判决。
+            bit_in_byte += 1
+            if bit_in_byte == 9:
+                if byte_count == 0:
+                    seg_rw = cur_value & 1
+                byte_count += 1
+                bit_in_byte = 0
+                cur_value = 0
+
+        # ---- 时钟拉伸记录（与仲裁分开）：有人已释放而总线仍低 ----
+        if scl == _LOW:
+            holders = tuple(m for m in masters if state[m][0] == _LOW)
+            # 已被判负的主机是强制释放，不算“被拖住”的在赛主机。
+            released = tuple(
+                m for m in masters if m not in losers and state[m][0] == _HIGH
+            )
+            if released:
+                if open_stretch is not None and open_stretch[1] == holders:
+                    pass  # 同一批持有者，区间延续
+                else:
+                    close_stretch(tick)
+                    open_stretch = [tick, holders, released]
+        else:
+            close_stretch(tick)
+
+        pscl, psda = scl, sda
+
+    close_stretch(items[-1].tick)
+
+    parsed = parse_updates(effective, stretch_limit=stretch_limit)
+    winners = tuple(m for m in masters if m not in losers)
+    return IterationResult(
+        winners=winners,
+        losses=tuple(losers[m] for m in masters if m in losers),
+        stretch_events=tuple(stretches),
+        effective_updates=tuple(effective),
+        result=parsed,
     )

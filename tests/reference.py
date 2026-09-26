@@ -325,3 +325,114 @@ def ref_simulate(
     if cur_tx is not None:
         completed.append(cur_tx)
     return completed
+
+
+# --------------------- 多主机仲裁迭代独立参考 ---------------------
+
+@dataclass
+class RefIter:
+    """ref_iterate 的输出：实际总线更新、各失败方首次冲突、拉伸区间。"""
+
+    effective: list[tuple[int, str, int, int]]
+    losses: dict[str, tuple[int, int]]          # master -> (tick, bit_index)
+    stretches: list[tuple[int, int, tuple[str, ...], tuple[str, ...]]]
+    winners: tuple[str, ...]
+
+
+def ref_iterate(raw: list[tuple[int, str, int, int]]) -> RefIter:
+    """逐拍真值表合成导线的独立参考（密集时刻扫描，不调用被测核心）。
+
+    规则独立重述：
+    - 每拍总线电平 = 所有主机主张的 AND（真值表：任一 0 则 0）；
+    - 段内数据位（每字第 1~8 拍，首字节或写方向）上升沿采到 0 而某主机
+      主张为释放（发 1）=> 该主机首次冲突，记入 losers；
+    - 第 9 拍（ACK）不判决；
+    - 失败主机从下一拍起强制 (1,1)（释放），其主张不再上线；
+    - SCL 低且存在已释放主机时记录拉伸区间（holders/released）。
+    """
+    table: dict[int, dict[str, tuple[int, int]]] = {}
+    order: list[str] = []
+    seen: set[tuple[int, str]] = set()
+    for t, d, scl, sda in raw:
+        if (t, d) in seen:
+            raise RefConflict(f"duplicate driver {d!r} at tick {t}")
+        seen.add((t, d))
+        table.setdefault(t, {})[d] = (scl, sda)
+        if d not in order:
+            order.append(d)
+    if len(order) < 2:
+        raise RefError("need at least two masters")
+
+    t0, t1 = min(table), max(table)
+    cur: dict[str, list[int]] = {d: [H, H] for d in order}
+    losers: dict[str, tuple[int, int]] = {}
+    eff: list[tuple[int, str, int, int]] = []
+    stretches: list[tuple[int, int, tuple[str, ...], tuple[str, ...]]] = []
+    open_st = None  # [start, holders, released]
+
+    pscl = psda = H
+    in_seg = False
+    pos = 0
+    bc = 0
+    rw = None
+    val = 0
+
+    for t in range(t0, t1 + 1):
+        for d, pair in table.get(t, {}).items():
+            if d in losers:
+                cur[d] = [H, H]
+            else:
+                cur[d] = [pair[0], pair[1]]
+            eff.append((t, d, cur[d][0], cur[d][1]))
+        scl = H
+        sda = H
+        for d in order:
+            scl &= cur[d][0]
+            sda &= cur[d][1]
+
+        if pscl == H and scl == H and psda == H and sda == L:
+            in_seg, pos, bc, rw, val = True, 0, 0, None, 0
+        elif pscl == H and scl == H and psda == L and sda == H:
+            in_seg = False
+        elif pscl == L and scl == H and in_seg:
+            sends = bc == 0 or rw == 0
+            if pos < 8:
+                if sends and sda == L:
+                    for d in order:
+                        if d not in losers and cur[d][1] == H:
+                            losers[d] = (t, pos)
+                val = (val << 1) | sda
+            pos += 1
+            if pos == 9:
+                if bc == 0:
+                    rw = val & 1
+                bc += 1
+                pos = 0
+                val = 0
+
+        if scl == L:
+            holders = tuple(d for d in order if cur[d][0] == L)
+            rel = tuple(d for d in order if d not in losers and cur[d][0] == H)
+            if rel:
+                if open_st is not None and open_st[1] == holders:
+                    pass
+                else:
+                    if open_st is not None:
+                        stretches.append((open_st[0], t, open_st[1], open_st[2]))
+                    open_st = [t, holders, rel]
+        else:
+            if open_st is not None:
+                stretches.append((open_st[0], t, open_st[1], open_st[2]))
+                open_st = None
+
+        pscl, psda = scl, sda
+
+    if open_st is not None:
+        stretches.append((open_st[0], t1, open_st[1], open_st[2]))
+
+    return RefIter(
+        effective=eff,
+        losses=losers,
+        stretches=stretches,
+        winners=tuple(d for d in order if d not in losers),
+    )

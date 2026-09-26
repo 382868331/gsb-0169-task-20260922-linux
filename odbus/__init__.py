@@ -3,7 +3,8 @@
 Public surface:
     Update, Line, Drive, Bit, ByteBlock, StartEvent, StopEvent,
     ArbitrationLoss, Segment, Transaction, ParseResult,
-    BusRecorder, parse_updates,
+    StretchEvent, IterationResult,
+    BusRecorder, parse_updates, iterate_masters,
     BusTraceError, InvalidUpdateError, ConflictingUpdateError,
     LimitError, StretchTimeoutError
 """
@@ -22,15 +23,17 @@ from .model import (
     BitSource,
     ByteBlock,
     Drive,
+    IterationResult,
     Line,
     ParseResult,
     Segment,
     StartEvent,
     StopEvent,
+    StretchEvent,
     Transaction,
     Update,
 )
-from .decoder import BusRecorder, parse_updates
+from .decoder import BusRecorder, iterate_masters, parse_updates
 from .validation import (
     MAX_DRIVER_COUNT,
     MAX_DRIVER_ID_LEN,
@@ -50,6 +53,7 @@ __all__ = [
     "ConflictingUpdateError",
     "Drive",
     "InvalidUpdateError",
+    "IterationResult",
     "LimitError",
     "Line",
     "MAX_DRIVER_COUNT",
@@ -61,8 +65,10 @@ __all__ = [
     "Segment",
     "StartEvent",
     "StopEvent",
+    "StretchEvent",
     "StretchTimeoutError",
     "Transaction",
     "Update",
+    "iterate_masters",
     "parse_updates",
 ]

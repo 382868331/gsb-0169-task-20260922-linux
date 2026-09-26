@@ -133,6 +133,26 @@ class ArbitrationLoss:
     driven_low_by: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class StretchEvent:
+    """时钟拉伸区间：部分主机已释放 SCL，但其它主机仍拉低，总线保持低电平。
+
+    与仲裁丢失**分开记录**：拉伸只是“低电平等待所有主机共同释放”，
+    不涉及任何数据位判决。
+
+    Attributes:
+        start_tick: 区间起始时刻（首个“有人已释放而总线仍低”的 tick）。
+        end_tick: 区间结束时刻（总线 SCL 重新升为高的 tick）。
+        holders: 区间内仍拉低 SCL 的主机（拉伸来源）。
+        released: 区间内已释放 SCL、被拖住的主机。
+    """
+
+    start_tick: int
+    end_tick: int
+    holders: tuple[str, ...]
+    released: tuple[str, ...]
+
+
 @dataclass
 class Segment:
     """一个“段”：一次 START（或重复 START）到下一个 rSTART/STOP/流末尾。
@@ -208,3 +228,28 @@ class ParseResult:
 
     def all_segments(self) -> tuple[Segment, ...]:
         return tuple(s for t in self.transactions for s in t.segments)
+
+
+@dataclass(frozen=True)
+class IterationResult:
+    """多主机逐拍驱动的仲裁迭代结果（见 odbus.iterate_masters）。
+
+    Attributes:
+        winners: 全程未被判仲裁丢失的主机（按驱动器注册序）。
+        losses: 每个失败主机的**首次**冲突位置（tick/字节内位序/阶段）。
+        stretch_events: 时钟拉伸区间，与仲裁丢失分开记录。
+        effective_updates: 失败方释放后实际合成总线的更新流
+            （已喂给 parse_updates 解码）。
+        result: 对实际总线更新解码出的事务（即赢家的解码事务）。
+    """
+
+    winners: tuple[str, ...]
+    losses: tuple[ArbitrationLoss, ...]
+    stretch_events: tuple[StretchEvent, ...]
+    effective_updates: tuple[Update, ...]
+    result: ParseResult
+
+    @property
+    def winner(self) -> Optional[str]:
+        """唯一未丢失仲裁的主机；并列（完全相同序列）或全灭时为 None。"""
+        return self.winners[0] if len(self.winners) == 1 else None
