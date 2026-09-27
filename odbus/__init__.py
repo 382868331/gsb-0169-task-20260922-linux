@@ -3,7 +3,7 @@
 Public surface:
     Update, Line, Drive, Bit, ByteBlock, StartEvent, StopEvent,
     ArbitrationLoss, Segment, Transaction, ParseResult,
-    BusRecorder, parse_updates,
+    BusRecorder, StreamingBusDecoder, parse_updates,
     BusTraceError, InvalidUpdateError, ConflictingUpdateError,
     LimitError, StretchTimeoutError
 """
@@ -30,7 +30,7 @@ from .model import (
     Transaction,
     Update,
 )
-from .decoder import BusRecorder, parse_updates
+from .decoder import BusRecorder, StreamingBusDecoder, parse_updates
 from .validation import (
     MAX_DRIVER_COUNT,
     MAX_DRIVER_ID_LEN,
@@ -59,6 +59,7 @@ __all__ = [
     "MIN_TICK",
     "ParseResult",
     "Segment",
+    "StreamingBusDecoder",
     "StartEvent",
     "StopEvent",
     "StretchTimeoutError",

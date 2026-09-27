@@ -20,7 +20,7 @@ START / STOP / 重复 START、在 SCL 上升沿采样 8 数据位 + 1 ACK、跟�
 odbus/              本题库（可 import odbus）
   __init__.py        公开接口汇总
   model.py           数据结构（Update/Bit/ByteBlock/Segment/Transaction/...）
-  decoder.py         核心算法（parse_updates / BusRecorder）
+  decoder.py         核心算法（parse_updates / StreamingBusDecoder / BusRecorder）
   errors.py          错误类型（全部继承 BusTraceError）
   validation.py      输入校验与接口上限
 tests/
@@ -44,7 +44,7 @@ python demo.py
 ### 输入
 
 ```python
-from odbus import Update, Drive, parse_updates
+from odbus import Update, Drive, parse_updates, StreamingBusDecoder
 
 Update(tick: int, driver: str, scl: Drive, sda: Drive)
 # tick   整数时刻，非递减；范围 [0, 1_000_000_000]
@@ -64,6 +64,21 @@ Update(tick: int, driver: str, scl: Drive, sda: Drive)
 ```python
 result = parse_updates(updates, stretch_limit=None)
 ```
+
+分批提供时使用 `StreamingBusDecoder.feed()`。每批最后一个时刻会被暂存；只有下一批
+出现更晚时刻，或调用方显式 `finish()` 时，才会处理该时刻。这样同一时刻的多条更新
+即使被拆分到两个批次，也会先完整合并再采样。
+
+```python
+decoder = StreamingBusDecoder(stretch_limit=None)
+decoder.feed(first_batch)
+decoder.feed(second_batch)
+result = decoder.finish()
+```
+
+`result()` 可在任意批次后查看当前已确认内容；`finish()` 只声明输入结束并冲刷最后一个
+暂存时刻，不会补造 STOP，因此未完成事务仍为 `closed=False`。处理一批时若校验或拉伸
+检查失败，识别器回滚到该批送入之前，不留下半批状态。
 
 - `stretch_limit: int | None`：SCL 允许连续为低的 tick 数。
   某时刻 `duration = tick - low_since` **严格大于** `limit` 时抛
@@ -122,7 +137,8 @@ result = parse_updates(updates, stretch_limit=None)
 7. **拉伸检查窗口**：对总线任意 SCL 连续低区间检查（不限事务内），因为“低超过
    阈值”本身就是总线级异常；低电平期间无更新、直到上升沿才超阈值时也会在上升沿补检。
 8. **同刻合并**：先按 tick 分组应用全部驱动器状态，再计算 AND、判边沿与采样，
-   严格满足“同刻更新先合并再判断边沿”。
+   严格满足“同刻更新先合并再判断边沿”。分批接口额外保留每批最后一个 tick，
+   直到确认同刻更新已全部到齐。
 
 ## 误差口径
 
@@ -162,4 +178,5 @@ result = parse_updates(updates, stretch_limit=None)
 - 多主机模型只识别“START 发起者”为主机；仲裁失败后不模拟该主机停止驱动后的
   完整状态机切换，只如实记录丢失事件与总线真实采样值。
 - 未参与任何事务的空闲 SCL 脉冲被忽略；START 前的总线活动不进入事务输出。
-- 更新必须非递减且一次性提供（或经 `BusRecorder` 顺序录入）；不支持乱序插入后重排。
+- 更新必须按 tick 非递减；可一次性提供、经 `BusRecorder` 顺序录入，或用
+  `StreamingBusDecoder.feed()` 分批提供；不支持乱序插入后重排。

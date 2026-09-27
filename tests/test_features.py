@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from odbus import Drive, parse_updates
+from odbus import Drive, StreamingBusDecoder, parse_updates
 from odbus.errors import StretchTimeoutError
 
 from reference import H, L
@@ -188,6 +188,103 @@ class MissingStopTests(unittest.TestCase):
         self.assertEqual(seg.blocks, [])
         self.assertEqual([b.value for b in seg.partial_bits], [1, 0, 1])
         self.assertFalse(result.transactions[0].closed)
+
+
+class BatchStreamingTests(unittest.TestCase):
+    def _simple_write(self):
+        raw = [U(0, "M", H, D)]
+        t = addr_byte_wave(raw, 1, 0x52 << 1 | 0, 0)
+        raw.append(U(t, "M", L, D))
+        raw.append(U(t, "V", H, R)); t += 1
+        raw.append(U(t, "M", H, D)); t += 1
+        raw.append(U(t, "M", H, R))
+        return raw
+
+    def test_split_at_every_batch_boundary_matches_one_shot(self):
+        raw = self._simple_write()
+        expected = parse_updates(raw)
+
+        for cut in range(1, len(raw) - 1):
+            with self.subTest(cut=cut):
+                decoder = StreamingBusDecoder()
+                decoder.feed(raw[:cut])
+                result = decoder.feed(raw[cut:]).finish()
+
+                self.assertEqual(len(result.transactions), 1)
+                self.assertTrue(result.transactions[0].closed)
+                seg = result.transactions[0].segments[0]
+                self.assertEqual(seg.address, 0x52)
+                self.assertEqual(seg.rw, 0)
+                self.assertEqual(seg.acks, expected.transactions[0].segments[0].acks)
+
+    def test_same_tick_updates_split_across_batches_are_merged(self):
+        first = [
+            U(0, "M", H, D),       # START
+            U(1, "M", L, R),       # 第一位脉冲开始；本批到此结束
+        ]
+        second = [
+            U(1, "V", H, D),       # 同一时刻另一驱动器也拉低 SDA
+            U(2, "M", H, R),
+            U(2, "V", H, D),       # 采样到 0
+        ]
+
+        decoder = StreamingBusDecoder()
+        decoder.feed(first)
+        interim = decoder.result()
+        self.assertEqual(interim.transactions[0].segments[0].partial_bits, [])
+        decoder.feed(second)
+        seg = decoder.finish().transactions[0].segments[0]
+
+        self.assertEqual([b.value for b in seg.partial_bits], [0])
+        self.assertEqual(bit_source_drivers(seg.partial_bits[0]), ("V",))
+
+    def test_finish_open_transaction_does_not_synthesize_stop(self):
+        raw = [U(0, "M", H, D)]
+        addr_byte_wave(raw, 1, 0x61 << 1 | 1, 0)
+
+        decoder = StreamingBusDecoder()
+        for update in raw:
+            decoder.feed([update])
+        result = decoder.finish()
+
+        tx = result.transactions[0]
+        seg = tx.segments[0]
+        self.assertFalse(tx.closed)
+        self.assertIsNone(seg.stop)
+        self.assertEqual((seg.address, seg.rw), (0x61, 1))
+
+    def test_stop_update_held_until_end_is_recognized_after_finish(self):
+        raw = self._simple_write()
+        decoder = StreamingBusDecoder()
+        decoder.feed(raw[:-1])
+        self.assertFalse(decoder.result().transactions[0].closed)
+        decoder.feed([raw[-1]])
+        self.assertTrue(decoder.finish().transactions[0].closed)
+
+    def test_failed_batch_rolls_back_to_state_before_batch(self):
+        decoder = StreamingBusDecoder(stretch_limit=3)
+        decoder.feed([
+            U(0, "M", H, D),
+            U(1, "M", L, R),
+        ])
+
+        with self.assertRaises(StretchTimeoutError):
+            decoder.feed([
+                U(5, "M", L, R),
+                U(6, "M", L, R),
+            ])
+
+        decoder.feed([U(2, "M", H, R)])
+        seg = decoder.finish().transactions[0].segments[0]
+        self.assertEqual([bit.value for bit in seg.partial_bits], [1])
+
+
+def bit_source_drivers(bit):
+    return tuple(
+        driver
+        for driver in bit.source.drivers
+        if driver in bit.source.sda_low_drivers
+    )
 
 
 if __name__ == "__main__":
