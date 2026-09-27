@@ -103,6 +103,104 @@ class BusRecorder:
         return parse_updates(self._updates, stretch_limit=stretch_limit)
 
 
+class IncrementalDecoder:
+    """分批提供更新的增量识别器。
+
+    总线事件有时只能分批到达：调用方反复 :meth:`feed` 若干批更新，
+    识别器在内部保留当前未完成的事务状态，下一批到来后继续识别；
+    全部输入结束后调用 :meth:`finish` 取得 :class:`ParseResult`。
+
+    语义保证：
+
+    * 分批结果与一次性 :func:`parse_updates` **完全一致**——批次边界即使落在
+      START / ACK 位 / STOP 附近，也不改变识别结果；
+    * **同一时刻的更新收齐后才采样**：每批最后一个时刻的分组会被暂时挂起，
+      直到出现更晚的时刻（或 `finish`）才合并判断边沿，避免把同刻分批到达
+      误认为先后发生；
+    * `finish` 是调用方对“输入已结束”的显式声明：此时仍未见 STOP 的事务
+      按未完成返回（`closed=False`、残余位进 `partial_bits`），
+      **不会**补出一个停止条件；
+    * 跨批次同样强制：时刻非递减、同一 `(tick, driver)` 只允许一条更新；
+      非法批次整体拒绝，不留下未说明的部分变更；
+    * `finish` 之后不允许再 `feed`；`finish` 可重复调用并返回同一结果。
+    """
+
+    def __init__(self, *, stretch_limit: int | None = None) -> None:
+        self._stretch_limit = require_stretch_limit(stretch_limit)
+        self._core = _Core(self._stretch_limit)
+        # 已收到但尚未确定“同刻更新已收齐”的最后时刻分组。
+        self._pending_tick: int | None = None
+        self._pending: list[Update] = []
+        self._pending_first_index: dict[str, int] = {}
+        self._total = 0  # 累计录入条数（用于跨批次错误定位）
+        self._finished = False
+        self._result: ParseResult | None = None
+
+    def feed(self, updates: Iterable[Update]) -> "IncrementalDecoder":
+        """录入一批更新；批次内/跨批次校验失败时整批拒绝，状态不变。"""
+        if self._finished:
+            raise InvalidUpdateError(
+                field="updates",
+                reason="finish() 已声明输入结束，不允许继续 feed",
+            )
+        items = _validate_updates(updates)
+        # 先整体校验本批与挂起分组的衔接，再逐条应用，避免部分变更。
+        # seen_* 跟踪“当前时刻已见驱动器”：跨批次时以挂起分组为种子，
+        # 批内时刻前进后重置（时刻非递减，更早时刻不可能再出现）。
+        seen_tick = self._pending_tick
+        seen: dict[str, int] = dict(self._pending_first_index)
+        base = self._total
+        for offset, u in enumerate(items):
+            idx = base + offset
+            if seen_tick is not None and u.tick < seen_tick:
+                raise InvalidUpdateError(
+                    field="tick",
+                    reason=(
+                        f"时刻必须非递减（跨批次）：tick={u.tick} 早于上一批末尾 "
+                        f"tick={seen_tick}"
+                    ),
+                    index=idx,
+                    tick=u.tick,
+                )
+            if u.tick != seen_tick:
+                seen_tick = u.tick
+                seen = {}
+            if u.driver in seen:
+                raise ConflictingUpdateError(
+                    tick=u.tick,
+                    driver=u.driver,
+                    index=idx,
+                    first_index=seen[u.driver],
+                )
+            seen[u.driver] = idx
+        self._total += len(items)
+        # 校验通过，逐条应用：同刻追加到挂起分组；更晚时刻先冲刷旧分组。
+        for offset, u in enumerate(items):
+            if self._pending_tick is None or u.tick > self._pending_tick:
+                self._flush_pending()
+                self._pending_tick = u.tick
+            self._pending_first_index.setdefault(u.driver, base + offset)
+            self._pending.append(u)
+        return self
+
+    def _flush_pending(self) -> None:
+        if self._pending_tick is not None and self._pending:
+            self._core.process_group(self._pending_tick, self._pending)
+        self._pending_tick = None
+        self._pending = []
+        self._pending_first_index = {}
+
+    def finish(self) -> ParseResult:
+        """声明输入结束并返回解析结果；未完成事务按未完成返回，不补 STOP。"""
+        if self._finished:
+            assert self._result is not None
+            return self._result
+        self._flush_pending()
+        self._result = self._core.finalize()
+        self._finished = True
+        return self._result
+
+
 def _validate_updates(updates: Iterable[Update]) -> list[Update]:
     result: list[Update] = []
     last_tick: int | None = None
@@ -170,35 +268,63 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
             )
         seen_key[key] = idx
 
-    # --- 驱动器状态（1=RELEASE，0=LOW），缺省为释放 ---
-    state: dict[str, list[int]] = {}
-    driver_order: list[str] = []
-
-    def level_of(driver: str, line: int) -> int:
-        return state[driver][line] if driver in state else _HIGH
-
-    transactions: list[Transaction] = []
-    cur_tx: Transaction | None = None
-    cur_seg: Segment | None = None
-    pending_bits: list[Bit] = []
-    byte_count = 0
-    bit_in_byte = 0          # 0..8：数据位计数；8 表示下一个脉冲是 ACK
-    pulse: _PendingPulse | None = None
-    seg_rw: int | None = None  # 当前段方向（首字节完成后确定）；读段数据位不查主机仲裁
-
-    pscl = psda = _HIGH
-    scl_low_since: int | None = None
-
+    core = _Core(stretch_limit)
     n = len(items)
     i = 0
     while i < n:
         tick = items[i].tick
-        group = [items[i]]
         j = i + 1
         while j < n and items[j].tick == tick:
-            group.append(items[j])
             j += 1
+        core.process_group(tick, items[i:j])
         i = j
+    return core.finalize()
+
+
+class _Core:
+    """逐“时刻分组”推进的解码状态机（`parse_updates` 与增量识别器共用）。"""
+
+    def __init__(self, stretch_limit: int | None) -> None:
+        self.stretch_limit = stretch_limit
+        # 驱动器状态（1=RELEASE，0=LOW），缺省为释放。
+        self.state: dict[str, list[int]] = {}
+        self.driver_order: list[str] = []
+        self.transactions: list[Transaction] = []
+        self.cur_tx: Transaction | None = None
+        self.cur_seg: Segment | None = None
+        self.pending_bits: list[Bit] = []
+        self.byte_count = 0
+        self.bit_in_byte = 0  # 0..8：数据位计数；8 表示下一个脉冲是 ACK
+        self.pulse: _PendingPulse | None = None
+        self.seg_rw: int | None = None  # 当前段方向；读段数据位不查主机仲裁
+        self.pscl = _HIGH
+        self.psda = _HIGH
+        self.scl_low_since: int | None = None
+        self.first_tick: int | None = None
+        self.last_tick: int | None = None
+
+    def level_of(self, driver: str, line: int) -> int:
+        return self.state[driver][line] if driver in self.state else _HIGH
+
+    def process_group(self, tick: int, group: list[Update]) -> None:
+        """合并应用同一时刻的全部更新，再统一判断边沿/采样/超时。"""
+        state = self.state
+        driver_order = self.driver_order
+        cur_tx = self.cur_tx
+        cur_seg = self.cur_seg
+        pending_bits = self.pending_bits
+        byte_count = self.byte_count
+        bit_in_byte = self.bit_in_byte
+        pulse = self.pulse
+        seg_rw = self.seg_rw
+        pscl = self.pscl
+        psda = self.psda
+        scl_low_since = self.scl_low_since
+        stretch_limit = self.stretch_limit
+
+        if self.first_tick is None:
+            self.first_tick = tick
+        self.last_tick = tick
 
         # 合并同一时刻的更新（不同驱动器彼此独立；同驱动器重复已在上面拒绝）。
         starters: list[str] = []
@@ -242,7 +368,7 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
                     starters=starters_sorted,
                 )
                 cur_tx = Transaction(segments=[cur_seg])
-                transactions.append(cur_tx)
+                self.transactions.append(cur_tx)
             pending_bits = []
             byte_count = 0
             bit_in_byte = 0
@@ -297,7 +423,7 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
                         master is not None
                         and bit_index < 8
                         and master_sends
-                        and level_of(master, 1) == _HIGH
+                        and self.level_of(master, 1) == _HIGH
                         and sda == _LOW
                     ):
                         cur_seg.arbitration_losses.append(
@@ -360,16 +486,28 @@ def parse_updates(updates: Iterable[Update], *, stretch_limit: int | None = None
         elif pscl == _HIGH:
             scl_low_since = tick
 
-        pscl, psda = scl, sda
+        # 回写状态（cur_tx/cur_seg 为可变对象，引用不变时无需回写，但 STOP 会置 None）。
+        self.cur_tx = cur_tx
+        self.cur_seg = cur_seg
+        self.pending_bits = pending_bits
+        self.byte_count = byte_count
+        self.bit_in_byte = bit_in_byte
+        self.pulse = pulse
+        self.seg_rw = seg_rw
+        self.pscl = scl
+        self.psda = sda
+        self.scl_low_since = scl_low_since
 
-    # ---- 流末尾：未见 STOP 的事务保持未关闭（缺 STOP 是合法输出而非异常）----
-    if cur_seg is not None:
-        cur_seg.partial_bits = list(pending_bits)
-
-    return ParseResult(
-        transactions=tuple(transactions),
-        drivers=tuple(driver_order),
-        final_scl=pscl,
-        final_sda=psda,
-        span_ticks=(items[-1].tick - items[0].tick) if items else 0,
-    )
+    def finalize(self) -> ParseResult:
+        # ---- 流末尾：未见 STOP 的事务保持未关闭（缺 STOP 是合法输出而非异常）----
+        if self.cur_seg is not None:
+            self.cur_seg.partial_bits = list(self.pending_bits)
+        first = self.first_tick
+        last = self.last_tick
+        return ParseResult(
+            transactions=tuple(self.transactions),
+            drivers=tuple(self.driver_order),
+            final_scl=self.pscl,
+            final_sda=self.psda,
+            span_ticks=(last - first) if first is not None and last is not None else 0,
+        )

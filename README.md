@@ -65,6 +65,29 @@ Update(tick: int, driver: str, scl: Drive, sda: Drive)
 result = parse_updates(updates, stretch_limit=None)
 ```
 
+### 分批（增量）解析
+
+总线事件只能分批提供时，用 `IncrementalDecoder` 保留未完成事务、跨批继续识别：
+
+```python
+from odbus import IncrementalDecoder
+
+dec = IncrementalDecoder(stretch_limit=None)
+dec.feed(batch1)          # 可反复喂任意多批；批内/跨批校验失败整批拒绝
+dec.feed(batch2)
+result = dec.finish()     # 调用方显式声明输入结束，返回同一个 ParseResult
+```
+
+- **分批结果与一次性 `parse_updates` 完全一致**：批次边界落在 START、ACK 位
+  或 STOP 附近都不改变识别结果；
+- **同刻收齐再采样**：每批最后一个时刻的分组会被挂起，直到更晚时刻出现
+  （或 `finish`）才合并判断边沿，同刻更新分批到达不会被误认为先后发生；
+- `finish` 是“输入结束”的显式声明：仍未见 STOP 的事务按未完成返回
+  （`closed=False`、残余位在 `partial_bits`），**不会**补出停止条件；
+- 跨批次同样强制时刻非递减与 `(tick, driver)` 唯一；失败批次不产生部分变更；
+- `finish` 可重复调用并返回同一结果；`finish` 后再 `feed` 抛
+  `InvalidUpdateError`。
+
 - `stretch_limit: int | None`：SCL 允许连续为低的 tick 数。
   某时刻 `duration = tick - low_since` **严格大于** `limit` 时抛
   `StretchTimeoutError`（即 `duration == limit` 仍合法）。`None` 表示不检查。
@@ -162,4 +185,5 @@ result = parse_updates(updates, stretch_limit=None)
 - 多主机模型只识别“START 发起者”为主机；仲裁失败后不模拟该主机停止驱动后的
   完整状态机切换，只如实记录丢失事件与总线真实采样值。
 - 未参与任何事务的空闲 SCL 脉冲被忽略；START 前的总线活动不进入事务输出。
-- 更新必须非递减且一次性提供（或经 `BusRecorder` 顺序录入）；不支持乱序插入后重排。
+- 更新必须非递减提供（一次性、`BusRecorder` 顺序录入或 `IncrementalDecoder`
+  分批喂入均可）；不支持乱序插入后重排。

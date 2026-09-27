@@ -30,7 +30,7 @@ from .model import (
     Transaction,
     Update,
 )
-from .decoder import BusRecorder, parse_updates
+from .decoder import BusRecorder, IncrementalDecoder, parse_updates
 from .validation import (
     MAX_DRIVER_COUNT,
     MAX_DRIVER_ID_LEN,
@@ -50,6 +50,7 @@ __all__ = [
     "ConflictingUpdateError",
     "Drive",
     "InvalidUpdateError",
+    "IncrementalDecoder",
     "LimitError",
     "Line",
     "MAX_DRIVER_COUNT",
